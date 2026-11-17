@@ -22,10 +22,3 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 For more information, please refer to <https://unlicense.org>
-
----
-
-Scope note: the Unlicense above covers the source code and the build
-scripts in this repository. It does not cover the game assets in
-`data/` (fonts, sprites) or any Deemo content downloaded at runtime —
-see THIRD_PARTY.md and data/fonts/README.md.
