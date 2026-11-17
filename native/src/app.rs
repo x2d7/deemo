@@ -463,7 +463,7 @@ impl App {
     }
 
     fn thumb_path(&self, song: usize) -> Option<String> {
-        let p = self.songs[song].cover.as_ref()?;
+        let p = self.songs.get(song)?.cover.as_ref()?;
         Some(p.replace("data/covers/", "data/covers_thumb/"))
     }
 
@@ -475,7 +475,7 @@ impl App {
 
     /// Полноразмерный арт песни для задника (ленивая фоновая загрузка).
     fn full_cover(&mut self, song: usize) -> Option<usize> {
-        let path = self.songs[song].cover.clone()?;
+        let path = self.songs.get(song)?.cover.clone()?;
         if let Some(&h) = self.covers.get(&path) {
             return Some(h);
         }
@@ -2910,7 +2910,7 @@ pub fn shot_screen(
             if screen == "replay" {
                 toast = Some(format!(
                     "Replay saved: data/replays/{}_hard.json",
-                    app.songs[sel].id
+                    app.songs.get(sel).map(|s| s.id.clone()).unwrap_or_default()
                 ));
             }
         }
@@ -3002,7 +3002,8 @@ pub fn shot_screen(
         _ => {
             app.mode = Mode::Library {
                 scroll: 0.0,
-                selected: Some(sel),
+                // на пустой библиотеке выбора нет — экран всё равно рисуется
+                selected: if app.songs.is_empty() { None } else { Some(sel) },
                 diff,
             };
             if screen == "library-menu" {
@@ -3018,7 +3019,7 @@ pub fn shot_screen(
         _ => None,
     };
     if let Some(si) = selected_song {
-        if let Some(path) = app.songs[si].cover.clone() {
+        if let Some(path) = app.songs.get(si).and_then(|s| s.cover.clone()) {
             if let Ok(img) = image::open(&path) {
                 let rgba = img.to_rgba8();
                 let (iw, ih) = rgba.dimensions();
@@ -3033,7 +3034,7 @@ pub fn shot_screen(
     // демо-шот: превью в headless не играет, поэтому берём ноты выбранного
     // чарта и фиксированную позицию — фон показывает настоящую картину песни
     if demo && (screen == "main" || screen.starts_with("library")) {
-        if let Some(c) = app.songs[sel].charts.get(diff) {
+        if let Some(c) = app.songs.get(sel).and_then(|s| s.charts.get(diff)) {
             if let Ok(chart) = Chart::load(&c.path) {
                 app.bg_notes = bg_notes_of(&chart);
                 app.bg_t_demo = Some(30.0);
