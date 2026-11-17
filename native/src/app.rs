@@ -2908,12 +2908,10 @@ pub fn shot_screen(
                 app.mode = Mode::Result { song: sel, diff, play };
             }
             if screen == "replay" {
-                if let Some(s) = app.songs.get(sel) {
-                    toast = Some(format!(
-                        "Replay saved: data/replays/{}_hard.json",
-                        s.id
-                    ));
-                }
+                toast = Some(format!(
+                    "Replay saved: data/replays/{}_hard.json",
+                    app.songs[sel].id
+                ));
             }
         }
         "settings" => {
@@ -3004,8 +3002,7 @@ pub fn shot_screen(
         _ => {
             app.mode = Mode::Library {
                 scroll: 0.0,
-                // без чартов выбирать нечего — библиотека рисуется пустой
-                selected: if app.songs.is_empty() { None } else { Some(sel) },
+                selected: Some(sel),
                 diff,
             };
             if screen == "library-menu" {
@@ -3021,7 +3018,7 @@ pub fn shot_screen(
         _ => None,
     };
     if let Some(si) = selected_song {
-        if let Some(path) = app.songs.get(si).and_then(|s| s.cover.clone()) {
+        if let Some(path) = app.songs[si].cover.clone() {
             if let Ok(img) = image::open(&path) {
                 let rgba = img.to_rgba8();
                 let (iw, ih) = rgba.dimensions();
@@ -3036,7 +3033,7 @@ pub fn shot_screen(
     // демо-шот: превью в headless не играет, поэтому берём ноты выбранного
     // чарта и фиксированную позицию — фон показывает настоящую картину песни
     if demo && (screen == "main" || screen.starts_with("library")) {
-        if let Some(c) = app.songs.get(sel).and_then(|s| s.charts.get(diff)) {
+        if let Some(c) = app.songs[sel].charts.get(diff) {
             if let Ok(chart) = Chart::load(&c.path) {
                 app.bg_notes = bg_notes_of(&chart);
                 app.bg_t_demo = Some(30.0);

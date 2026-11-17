@@ -1,25 +1,12 @@
 # deemo
 
-A Deemo-style rhythm game for Linux, written in Rust — native `wgpu` rendering,
-no engine, no browser. It recreates the classic piano-in-the-dark presentation:
-a song library with previews and records, falling-note play at the judge line,
-and a result screen with a tap-timing histogram and offset suggestions.
+A Deemo-style rhythm game for Linux: a song library with previews and records,
+falling-note play at the judge line, and a result screen with a tap-timing
+histogram.
 
-This is a personal fan project. Charts and audio are not bundled; the game reads
-them from `data/` and can pull the vanilla set from a chart server.
+A chart server can be connected for uploading and downloading charts.
 
 ![song select](screenshots/main.png)
-
-## Requirements
-
-* Linux (x86_64). Wayland or X11; on Wayland the game uses a native surface, on
-  X11/XWayland it also accepts drag & drop.
-* A GPU with a working driver — the renderer is `wgpu` 30, Vulkan is the primary
-  backend, OpenGL is used as a fallback where available.
-* Runtime libraries reported by `ldd` for the release binary:
-  `libasound.so.2` (ALSA), `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`.
-* Optional: `kdialog` or `zenity` for the `F7` "install pack from file" dialog.
-* Optional: a system CJK font (Noto Sans CJK) for Japanese/Chinese titles.
 
 ## Install from release
 
@@ -36,7 +23,7 @@ The game keeps its state in `data/` next to the binary — settings, results,
 replays, imported packs. Run it from the extracted directory (the paths are
 relative to the working directory).
 
-Check `SHA256SUMS` if you like:
+Verify the download:
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -53,11 +40,7 @@ Run it from the repository root so that `data/` is found: the game resolves
 `data/fonts/`, `data/sprites/`, `data/imported/` and its own state files
 relative to the working directory.
 
-The build needs edition 2024, so Rust 1.85 or newer; the v0.1.0 binary was built
-with **rustc 1.99.1** (`cargo 1.99.1`) on Fedora. The release toolchain was
-project-local — `CARGO_HOME` and `RUSTUP_HOME` pointed at a pinned copy of the
-toolchain, with `PATH="$CARGO_HOME/bin:$PATH"` — but any recent stable Rust
-works just as well.
+The build needs edition 2024, so Rust 1.85 or newer.
 
 ## Adding charts
 
@@ -132,17 +115,6 @@ The menu scroll speed itself is adjusted with `Ctrl+[` / `Ctrl+]`.
 
 ![result](screenshots/results.png)
 
-## Server
-
-Scores, leaderboards and pack downloads are served by a separate self-hosted
-service, [x2d7/deemo-server](https://github.com/x2d7/deemo-server) (private).
-The client defaults to the public instance at `http://199.247.22.102`, which
-also serves the chart archive and the vanilla pack bundle. The address is
-configurable: Settings → *Server URL*, then *Sign in* or *Create account*.
-
-Scores played offline are queued in `data/online_queue.json` and uploaded when
-the server is reachable again.
-
 ## Licence
 
 The code is released into the public domain — [Unlicense](LICENSE). Do what you
@@ -157,7 +129,5 @@ the game simply falls back to Noto Sans and still starts.
 
 ## Status
 
-Personal fan project, not affiliated with Rayark or the Deemo authors. Charts,
-audio, covers and previews are not distributed with it — bring your own, or pull
-them from the chart server. Development happens against one machine (Fedora,
-Wayland, NVIDIA), so other setups may need small fixes.
+Not affiliated with Rayark or the Deemo authors. Charts, audio and covers are
+not distributed with the game.
