@@ -1,0 +1,36 @@
+# build output
+target/
+native/target/
+
+# toolchain and scratch space kept outside the repo
+.cargo/
+.rustup/
+.work/
+
+# game data that must never be committed: charts, audio, art, per-user state
+data/library.json.local
+data/auth.json
+data/results.json
+data/settings.json
+data/online_queue.json
+data/server_db.json
+data/auto_tags.json
+data/charts/
+data/audio/
+data/covers/
+data/covers_thumb/
+data/preview/
+data/imported/
+data/inbox/
+data/replays/
+data/songs/
+data/icons/
+data/bundle/
+
+# packs and dumps dropped into the working tree
+*.deemopack
+*.xapk
+*.apk
+*.obb
+*.part
+*.part.etag
