@@ -979,13 +979,15 @@ impl App {
         // кнопки сложности — переключают сложность (не запускают), в нижней полосе
         self.diff_rects.clear();
         if let Some(si) = selected {
-            let n = self.songs[si].charts.len();
-            self.diff_rects = screens::diff_chip_rects(wf, hf, &geom, &chrome, n);
+            if let Some(song) = self.songs.get(si) {
+                let n = song.charts.len();
+                self.diff_rects = screens::diff_chip_rects(wf, hf, &geom, &chrome, n);
+            }
         }
         // вкладки сложности в панели истории — фильтр по сложности
         self.hist_diff_rects.clear();
         if let Some(si) = selected {
-            let n = self.songs[si].charts.len().max(1);
+            let n = self.songs.get(si).map_or(1, |s| s.charts.len().max(1));
             let tab_w = (geom.left_w - geom.margin * 2.0) / n as f32;
             for d in 0..n {
                 self.hist_diff_rects.push((
@@ -2868,7 +2870,9 @@ pub fn shot_screen(
             };
         }
         "pause" | "play" => {
-            app.start_play(sel, diff);
+            if app.songs.get(sel).is_some() {
+                app.start_play(sel, diff);
+            }
             if let Mode::Play { play, paused, .. } = &mut app.mode {
                 play.score = 874_320;
                 play.combo = 63;
@@ -2881,7 +2885,7 @@ pub fn shot_screen(
             app.left_held = false;
         }
         "results" | "replay" => {
-            if let Some(c) = app.songs[sel].charts.get(diff) {
+            if let Some(c) = app.songs.get(sel).and_then(|s| s.charts.get(diff)) {
                 let chart = Chart::load(&c.path)?;
                 let mut play = Play::new(&chart);
                 let mut seed = 0x1234_5678u64;
@@ -2904,10 +2908,12 @@ pub fn shot_screen(
                 app.mode = Mode::Result { song: sel, diff, play };
             }
             if screen == "replay" {
-                toast = Some(format!(
-                    "Replay saved: data/replays/{}_hard.json",
-                    app.songs[sel].id
-                ));
+                if let Some(s) = app.songs.get(sel) {
+                    toast = Some(format!(
+                        "Replay saved: data/replays/{}_hard.json",
+                        s.id
+                    ));
+                }
             }
         }
         "settings" => {
@@ -2998,7 +3004,8 @@ pub fn shot_screen(
         _ => {
             app.mode = Mode::Library {
                 scroll: 0.0,
-                selected: Some(sel),
+                // без чартов выбирать нечего — библиотека рисуется пустой
+                selected: if app.songs.is_empty() { None } else { Some(sel) },
                 diff,
             };
             if screen == "library-menu" {
