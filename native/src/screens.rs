@@ -220,9 +220,9 @@ pub struct LibraryView<'a> {
     pub total_h: f32,
     pub scroll: f32,
     pub t: f32,
-    /// настоящие ноты выбранной песни (time, pos, size) для фона меню
-    pub bg_notes: &'a [(f32, f32, f32)],
-    /// позиция превью в секундах; None — превью не играет, фон случайный
+    /// настоящие ноты выбранной песни (живое падающее поле) для фона меню
+    pub bg_notes: &'a [crate::bg::BgNote],
+    /// часы поля; None — превью не играет, фон случайный
     pub bg_t: Option<f32>,
 }
 
@@ -238,13 +238,49 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     theme::fill(ui, white, [0.0, 0.0, w, h], theme::BG);
     let bg = [
         g.left_w + 12.0 * s,
-        0.0,
+        g.top_h,
         (w - 8.0 * s) - (g.left_w + 12.0 * s),
-        bottom_y,
+        bottom_y - g.top_h,
     ];
     let real_notes = v.bg_t.filter(|_| !v.bg_notes.is_empty());
     if let Some(t) = real_notes {
-        theme::note_keys(ui, white, bg, v.bg_notes, t, theme::NOTE_LEAD, 0.07, s);
+        // Мини-поле не заходит на арт и не трогает верхнюю панель: в
+        // библиотеке оно живёт только в колонке списка, в main — в фоне
+        // списка/титульного блока, но всегда ниже top_h.
+        let (field, dim) = if g.art.is_some() {
+            ([g.rx, g.top_h, g.rw, bottom_y - g.top_h], None)
+        } else if v.selected.is_none() {
+            // main: поле живёт по всему фону, но под титульным блоком
+            // приглушается, чтобы вордмарк оставался главным; нити слайдов
+            // ограничены колонкой списка (link_clip ниже)
+            let r = title_block_rect(g, w, bottom_y, s);
+            let pad = 20.0 * s;
+            (
+                [
+                    g.rx,
+                    g.top_h,
+                    (w - g.margin - g.rx).max(200.0 * s),
+                    bottom_y - g.top_h,
+                ],
+                Some((
+                    [r[0] - pad, r[1] - pad, r[2] + pad * 2.0, r[3] + pad * 2.0],
+                    0.35,
+                )),
+            )
+        } else {
+            (bg, None)
+        };
+        theme::chart_fall(
+            ui,
+            white,
+            field,
+            v.bg_notes,
+            t,
+            0.066,
+            s,
+            dim,
+            Some([g.rx, g.top_h, g.rw, bottom_y - g.top_h]),
+        );
     } else {
         theme::falling_keys(
             ui,
@@ -297,8 +333,9 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
             theme::label(text, ui, "LV", chip[0] + 10.0 * s, chip[1] + 8.0 * s, 8.0 * s, 2.2 * s, INK_DIM);
             text.draw_face(Face::Serif, &lv, chip[0] + 10.0 * s, chip[1] + 19.0 * s, 20.0 * s, INK_HI, ui);
         }
-    } else {
-        // без арта — широкое поле для заголовка
+    } else if real_notes.is_none() {
+        // без арта — широкое поле для заголовка; когда падает настоящий чарт,
+        // второй случайный мотив не подмешиваем
         theme::falling_keys(
             ui,
             white,
@@ -312,6 +349,15 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
             s,
         );
     }
+
+    // мягкая подложка списка: полосы не должны спорить с названиями песен.
+    // Очень низкая альфа — это фон, а не карточка.
+    theme::fill(
+        ui,
+        white,
+        [g.rx, g.top_h, g.rw, bottom_y - g.top_h],
+        [0.0, 0.0, 0.0, 0.32],
+    );
 
     // === левая колонка: рекорды ===
     draw_records(ctx, v, ui, bottom_y);
@@ -354,25 +400,33 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     }
 }
 
+/// Прямоугольник титульного блока main-состояния (вордмарк, девиз, подсказка).
+/// Один и тот же для отрисовки и для приглушения падающего поля под ним.
+fn title_block_rect(g: &LibGeom, w: f32, bottom_y: f32, s: f32) -> [f32; 4] {
+    let area_x = g.rx + g.rw + 48.0 * s;
+    let area_w = (w - g.margin - area_x).max(200.0 * s);
+    let panel_w = area_w.min(440.0 * s);
+    let panel_x = area_x + (area_w - panel_w) * 0.5;
+    let cy = g.top_h + (bottom_y - g.top_h) * 0.5;
+    [panel_x, cy - 170.0 * s, panel_w, 260.0 * s]
+}
+
 /// Титульный блок главного состояния: вордмарк, девиз и подсказка.
 fn draw_title_block(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32) {
     let text = ctx.text;
     let white = ctx.white;
     let s = ctx.s;
     let g = v.geom;
-    let area_x = g.rx + g.rw + 48.0 * s;
-    let area_w = (ctx.w - g.margin - area_x).max(200.0 * s);
-    let panel_w = area_w.min(440.0 * s);
-    let panel_x = area_x + (area_w - panel_w) * 0.5;
-    let cx = panel_x + panel_w * 0.5;
-    let cy = g.top_h + (bottom_y - g.top_h) * 0.5;
+    let r = title_block_rect(g, ctx.w, bottom_y, s);
+    let cx = r[0] + r[2] * 0.5;
+    let cy = r[1] + r[3] * 0.5;
     text.draw_centered_face(Face::Display, "DEEMO", cx, cy - 150.0 * s, 72.0 * s, INK_HI, ui);
     text.draw_centered_tracked(Face::Serif, "PIANO · MEMORY · A GIRL", cx, cy - 62.0 * s, 9.0 * s, 3.4 * s, INK_DIM, ui);
     theme::hair_h(ui, white, cx - 70.0 * s, cy - 32.0 * s, 140.0 * s, RULE_STRONG, s);
     text.draw_centered_tracked(Face::Serif, "PRESS A SONG", cx, cy - 6.0 * s, 10.0 * s, 3.4 * s, ACCENT_INK, ui);
     text.draw_centered("Pick a song from the list", cx, cy + 22.0 * s, 12.0 * s, INK_DIM, ui);
     text.draw_centered("The preview starts on its own", cx, cy + 42.0 * s, 11.0 * s, INK_FAINT, ui);
-    theme::corner_ticks(ui, white, [panel_x, cy - 170.0 * s, panel_w, 260.0 * s], [0.84, 0.80, 0.72, 0.18], 14.0 * s, s);
+    theme::corner_ticks(ui, white, r, [0.84, 0.80, 0.72, 0.18], 14.0 * s, s);
 }
 
 fn draw_topbar(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {

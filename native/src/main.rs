@@ -3,6 +3,7 @@
 
 mod app;
 mod audio;
+mod bg;
 mod chart;
 mod clock;
 mod library;

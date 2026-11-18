@@ -284,10 +284,13 @@ pub struct App {
     dropdown_rects: Vec<(u8, [f32; 4])>,
     total_h: f32,
     last_selected: Option<usize>,
-    /// фон меню: ноты выбранного чарта (time, pos, size) и ключ (песня, сложность)
-    bg_notes: Vec<(f32, f32, f32)>,
-    bg_notes_key: Option<(String, String)>,
-    bg_notes_rx: Option<Receiver<((String, String), Vec<(f32, f32, f32)>)>>,
+    /// фон меню: миниатюрная падающая сцена выбранного чарта
+    bg_field: crate::bg::BgField,
+    /// ключ (песня, сложность) чарта, который сейчас пишет в поле
+    bg_key: Option<(String, String)>,
+    bg_rx: Option<Receiver<((String, String), Option<crate::bg::BgSource>)>>,
+    /// прошлый кадр для дельты часов фона
+    bg_last: Option<Instant>,
     /// фиксированное время для headless-демо (`--demo`): превью в шоте не играет
     bg_t_demo: Option<f32>,
     /// сохранённая позиция библиотеки (восстанавливается после игры)
@@ -306,21 +309,6 @@ pub struct App {
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const DIM: [f32; 4] = [1.0, 1.0, 1.0, 0.6];
-/// Потолок кэша фоновых нот меню: даже гигантский чарт не съест память.
-const BG_NOTES_CAP: usize = 20_000;
-
-/// Компактный список нот для фона меню: (время, позиция, размер).
-/// `Chart::load` уже сортирует ноты по времени, так что поиск по окну в
-/// `theme::note_key_rects` идёт бинарным срезом.
-fn bg_notes_of(chart: &Chart) -> Vec<(f32, f32, f32)> {
-    chart
-        .notes
-        .iter()
-        .filter(|n| n.time.is_finite())
-        .take(BG_NOTES_CAP)
-        .map(|n| (n.time, n.pos, n.size))
-        .collect()
-}
 
 impl App {
     fn new() -> Result<App> {
@@ -435,9 +423,10 @@ impl App {
             dropdown_rects: Vec::new(),
             total_h: 0.0,
             last_selected: None,
-            bg_notes: Vec::new(),
-            bg_notes_key: None,
-            bg_notes_rx: None,
+            bg_field: crate::bg::BgField::default(),
+            bg_key: None,
+            bg_rx: None,
+            bg_last: None,
             bg_t_demo: None,
             saved_scroll: 0.0,
             sbar_track: None,
@@ -653,39 +642,55 @@ impl App {
 
     /// Загрузить в фон меню ноты выбранного чарта. Поток читает JSON, UI не
     /// ждёт; ошибки молчат — тогда остаётся случайный мотив.
-    fn ensure_bg_notes(&mut self, selected: Option<usize>, diff: usize) {
-        let Some(si) = selected else { return };
+    ///
+    /// Смена песни/сложности НЕ чистит уже падающее поле: сразу гасим эмиссию
+    /// из старого источника, а когда придёт новый — ставим его курсор на
+    /// текущую позицию превью. Старые ноты продолжают падать сами по себе.
+    fn ensure_bg_source(&mut self, selected: Option<usize>, diff: usize) {
+        let Some(si) = selected else {
+            // ничего не выбрано — новых нот не будет, но поле доедет само
+            if self.bg_key.take().is_some() {
+                self.bg_field.clear_source();
+            }
+            return;
+        };
         let Some(song) = self.songs.get(si) else { return };
         let Some(chart) = song.charts.get(diff) else { return };
         let key = (song.id.clone(), chart.diff.clone());
-        if self.bg_notes_key.as_ref() == Some(&key) {
+        if self.bg_key.as_ref() == Some(&key) {
             return;
         }
         // сразу помечаем ключ: даже пока чарт грузится, повторно не спавним
-        self.bg_notes_key = Some(key.clone());
-        self.bg_notes.clear();
+        self.bg_key = Some(key.clone());
+        // старый источник молчит; живые ноты не трогаем
+        self.bg_field.clear_source();
         let path = chart.path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        self.bg_notes_rx = Some(rx);
+        self.bg_rx = Some(rx);
         std::thread::spawn(move || {
-            let notes = Chart::load(&path).map(|c| bg_notes_of(&c)).unwrap_or_default();
-            let _ = tx.send((key, notes));
+            let src = Chart::load(&path)
+                .ok()
+                .map(|c| crate::bg::BgSource::from_chart(&c));
+            let _ = tx.send((key, src));
         });
     }
 
     /// Принять результат фоновой загрузки нот (как auth_rx/lb_rx).
-    fn poll_bg_notes(&mut self) {
-        let Some(rx) = &self.bg_notes_rx else { return };
+    fn poll_bg_source(&mut self) {
+        let Some(rx) = &self.bg_rx else { return };
         match rx.try_recv() {
-            Ok((key, notes)) => {
+            Ok((key, src)) => {
                 // пока грузили, могли выбрать другую песню — старый ответ мимо
-                if self.bg_notes_key.as_ref() == Some(&key) {
-                    self.bg_notes = notes;
+                if self.bg_key.as_ref() == Some(&key) {
+                    if let Some(src) = src {
+                        let now = self.bg_time().unwrap_or(0.0);
+                        self.bg_field.set_source(src, now);
+                    }
                 }
-                self.bg_notes_rx = None;
+                self.bg_rx = None;
             }
             Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => self.bg_notes_rx = None,
+            Err(TryRecvError::Disconnected) => self.bg_rx = None,
         }
     }
 
@@ -700,6 +705,48 @@ impl App {
         }
         let t = g.music.time();
         (t.is_finite()).then(|| t.max(0.0))
+    }
+
+    /// Двигать падающее поле каждый кадр. Часы фона идут по стенным дельтам,
+    /// а не по скачкам позиции превью: перезапуск трека при смене песни не
+    /// должен телепортировать уже летящие ноты.
+    fn tick_bg(&mut self) {
+        let Some(now) = self.bg_time() else {
+            self.bg_last = None;
+            return;
+        };
+        let inst = Instant::now();
+        let dt = self
+            .bg_last
+            .map(|last| inst.duration_since(last).as_secs_f32())
+            .unwrap_or(0.0);
+        self.bg_last = Some(inst);
+        self.bg_field.advance(dt.clamp(0.0, 0.1), now);
+    }
+
+    /// Время для рисования поля: только пока идёт превью/демо и есть живые
+    /// ноты. Иначе экран рисует случайный мотив.
+    fn bg_view_time(&self) -> Option<f32> {
+        self.bg_time()?;
+        (!self.bg_field.is_empty()).then(|| self.bg_field.clock())
+    }
+
+    /// Перо эмулирует системную мышь через libinput/OTD. Такое событие мыши
+    /// надо игнорировать, иначе в игре получается двойной удар (hidraw +
+    /// эмулированный клик). udev-правило намеренно не ставим: оно сломало бы
+    /// планшет для всей системы.
+    fn pen_emulated_mouse(&self) -> bool {
+        let Some(tablets) = self.tablets.as_ref() else {
+            return false;
+        };
+        let (w, _) = self.size();
+        crate::tablet::pen_emulates_mouse(
+            tablets.pen_pressed_within(crate::tablet::PEN_PRESS_GRACE),
+            tablets.pen_down(),
+            tablets.pen_report_within(crate::tablet::PEN_REPORT_GRACE),
+            self.cursor[0],
+            w as f32,
+        )
     }
 
     fn to_library(&mut self) {
@@ -729,8 +776,8 @@ impl App {
             // сброс кэша полноразмерных артов, т.к. набор песен изменился
             self.full_dims.clear();
             // ноты фона тоже могли переехать — перечитаем при следующем кадре
-            self.bg_notes_key = None;
-            self.bg_notes.clear();
+            self.bg_key = None;
+            self.bg_field.clear_source();
             self.imported_sig = imported_sig();
         }
     }
@@ -892,7 +939,7 @@ impl App {
             _ => return,
         };
         // фон: настоящие ноты выбранной песни (перезагрузка при смене песни/сложности)
-        self.ensure_bg_notes(selected, diff);
+        self.ensure_bg_source(selected, diff);
         let geom = self.menu_geom(selected);
 
         // сортировка + группировка (общая логика из library)
@@ -1139,6 +1186,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Пока перо нажато, оно тащит эмулированный системный курсор;
+                // настоящая мышь в этот момент «припаркована» и не должна
+                // сдвигать игровой курсор.
+                if self.tablets.as_ref().is_some_and(|t| t.pen_down()) {
+                    return;
+                }
                 self.cursor = [position.x as f32, position.y as f32];
                 if self.sbar_drag.is_some() && self.left_held {
                     self.sbar_drag_to(self.cursor[1]);
@@ -1174,6 +1227,12 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Перо дублирует мышь через libinput/OTD. Свежий нажим пера,
+                // нажатое перо или курсор рядом с пером — значит клик пришёл
+                // от пера: не трогаем left_held, on_click и реплей.
+                if self.pen_emulated_mouse() {
+                    return;
+                }
                 self.left_held = state == ElementState::Pressed;
                 let t = match &self.mode {
                     Mode::Play { clock, .. } => Some(clock.wall_to_time(Instant::now())),
@@ -1250,7 +1309,7 @@ impl ApplicationHandler for App {
         // вход/регистрация из экрана настроек (фон)
         self.poll_auth();
         // фон меню: ноты выбранного чарта (фоновый поток)
-        self.poll_bg_notes();
+        self.poll_bg_source();
         // очередь рекордов: события фонового потока (тосты) + редкий ретрай
         self.poll_online_queue();
         if self.last_queue_flush.elapsed().as_secs() >= 45 {
@@ -2202,6 +2261,8 @@ impl App {
         if self.gfx.is_none() {
             return;
         }
+        // фон библиотеки: двигаем падающее поле до layout/рисования
+        self.tick_bg();
         let (w, h) = self.size();
         self.gfx.as_mut().unwrap().renderer.set_ui_size(w, h);
 
@@ -2604,8 +2665,8 @@ impl App {
             total_h: self.total_h,
             scroll,
             t: anim_t,
-            bg_notes: &self.bg_notes,
-            bg_t: self.bg_time(),
+            bg_notes: self.bg_field.live(),
+            bg_t: self.bg_view_time(),
         };
         screens::draw_library(&ctx, &view, ui);
     }
@@ -2813,6 +2874,30 @@ impl App {
 ///
 /// Для `--screen settings` флаг `--packs running|done|cancelled` подставляет
 /// синтетический прогресс строки «Download all packs» (в сеть не ходим).
+/// Демо-скриншот: собрать источник фона из чарта (song, diff).
+fn demo_bg_source(app: &App, song: usize, diff: usize) -> Option<crate::bg::BgSource> {
+    let c = app.songs.get(song)?.charts.get(diff)?;
+    let chart = Chart::load(&c.path).ok()?;
+    Some(crate::bg::BgSource::from_chart(&chart))
+}
+
+/// Демо-скриншот: «прогреть» поле перед фиксированным временем `t`, чтобы в
+/// кадре были не только будущие ноты, но и те, что уже вошли в кадр. Шаги по
+/// 1/60 с имитируют обычный игровой цикл (никакой анимации в headless нет).
+fn demo_bg_warm(app: &mut App, song: usize, diff: usize, t: f32) {
+    let Some(src) = demo_bg_source(app, song, diff) else { return };
+    let warm = crate::bg::BG_FALL;
+    let start = t - warm;
+    app.bg_field.reset(start);
+    app.bg_field.set_source(src, start);
+    let steps = 120;
+    for i in 1..=steps {
+        let dt = warm / steps as f32;
+        app.bg_field.advance(dt, start + dt * i as f32);
+    }
+    app.bg_t_demo = Some(t);
+}
+
 pub fn shot_screen(
     out: &str,
     screen: &str,
@@ -2852,8 +2937,6 @@ pub fn shot_screen(
         .ok()
         .and_then(|id| app.songs.iter().position(|s| s.id == id))
         .unwrap_or(sel);
-    // Пустая библиотека (свежая установка без чартов) — скриншот всё равно
-    // должен рендериться: сложность 0, песня не нужна экрану меню.
     let diff = app
         .songs
         .get(sel)
@@ -3002,7 +3085,6 @@ pub fn shot_screen(
         _ => {
             app.mode = Mode::Library {
                 scroll: 0.0,
-                // на пустой библиотеке выбора нет — экран всё равно рисуется
                 selected: if app.songs.is_empty() { None } else { Some(sel) },
                 diff,
             };
@@ -3031,13 +3113,29 @@ pub fn shot_screen(
     }
     app.layout();
 
-    // демо-шот: превью в headless не играет, поэтому берём ноты выбранного
-    // чарта и фиксированную позицию — фон показывает настоящую картину песни
+    // демо-шот: превью в headless не играет, поэтому поле прогревается до
+    // фиксированной позиции — фон показывает настоящую картину песни.
+    // DEEMO_BG_T — время фона (по умолчанию 30), DEEMO_BG_SWAP — сложность,
+    // на которую «переключаемся» без очистки уже летящих нот.
     if demo && (screen == "main" || screen.starts_with("library")) {
-        if let Some(c) = app.songs.get(sel).and_then(|s| s.charts.get(diff)) {
-            if let Ok(chart) = Chart::load(&c.path) {
-                app.bg_notes = bg_notes_of(&chart);
-                app.bg_t_demo = Some(30.0);
+        let t: f32 = std::env::var("DEEMO_BG_T")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30.0);
+        demo_bg_warm(&mut app, sel, diff, t);
+        if let Some(swap) = std::env::var("DEEMO_BG_SWAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            // держим уже летящие ноты: меняем только источник будущих
+            app.bg_field.advance(0.5, t + 0.5);
+            if let Some(src) = demo_bg_source(&app, sel, swap) {
+                app.bg_field.set_source(src, t + 0.5);
+            }
+            app.bg_field.advance(0.5, t + 1.0);
+            app.bg_t_demo = Some(t + 1.0);
+            if let Mode::Library { diff: d, .. } = &mut app.mode {
+                *d = swap;
             }
         }
     }

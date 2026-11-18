@@ -4,6 +4,7 @@
 //! Цвета заданы в линейное пространстве (рендер умножает их в linear и пишет в
 //! sRGB-таргет), поэтому значения намеренно ниже «экранных».
 
+use crate::bg::BgNote;
 use crate::render::{Renderer, UiQuad};
 use crate::text::{Face, Text};
 
@@ -293,103 +294,189 @@ pub fn falling_keys(
     }
 }
 
-// --- мотив «настоящие ноты песни» ---
+// --- мотив «миниатюра падающего чарта» ---
 
-/// Сколько секунд до «момента ноты» видно в фоне меню.
-pub const NOTE_LEAD: f32 = 3.5;
-/// Потолок полос за кадр: плотный чарт не должен превращаться в стену.
-pub const NOTE_KEY_MAX: usize = 48;
-/// Нота перестаёт рисоваться чуть раньше `t`, чтобы не мигать на нижней кромке.
-const NOTE_TAIL: f32 = 0.15;
+/// Максимальный размах нити слайда относительно поля по каждой оси: только
+/// короткие локальные диагонали рядом с нотами. Полотно, перечёркнутое
+/// линией через пол-экрана, читается как царапина, а не как слайд.
+const LINK_SPAN: f32 = 0.28;
 
-/// Прямоугольники полос для нот из окна `[t - 0.15, t + lead]`.
+/// Нарисовать падающее поле меню: плоские полосы-ноты и тонкие нити слайдов.
 ///
-/// Чистая функция (без GPU) — по ней же идут тесты. `rect` = `[x, top, w, h]`,
-/// `notes` отсортированы по времени. Полоса «приходит» в момент ноты: её
-/// нижний торец стоит на нижней границе `rect`, когда `time == t`, и на
-/// верхней, когда `time == t + lead`. Сами полосы не обрезаются по `rect` —
-/// это делает [`note_keys`] при рисовании.
+/// `notes` — живой набор [`crate::bg::BgField`], `now` — его часы. В отличие
+/// от старого «окна анализа» здесь нет обрезки по внутреннему прямоугольнику,
+/// градиентов и ярких торцов: полоса просто едет вниз, уходит под нижнюю
+/// кромку и перекрывается нижней панелью. Ширина/длина зависят только от
+/// `size`, поэтому фон читается как мини-поле, а не график.
 ///
-/// Позиция ноты (-2..2) отображается на всю ширину, размер задаёт толщину и
-/// длину полосы. Если в окне больше [`NOTE_KEY_MAX`] нот, берётся каждая N-я.
-pub fn note_key_rects(
-    rect: [f32; 4],
-    notes: &[(f32, f32, f32)],
-    t: f32,
-    lead: f32,
-    s: f32,
-) -> Vec<[f32; 4]> {
-    let (x0, top, w, h) = (rect[0], rect[1], rect[2], rect[3]);
-    if w <= 0.0 || h <= 0.0 || lead <= 0.0 || notes.is_empty() {
-        return Vec::new();
-    }
-    let from = t - NOTE_TAIL;
-    let to = t + lead;
-    let start = notes.partition_point(|n| n.0 < from);
-    let end = notes.partition_point(|n| n.0 <= to);
-    if start >= end {
-        return Vec::new();
-    }
-    let count = end - start;
-    let stride = count.div_ceil(NOTE_KEY_MAX).max(1);
-    let mut out = Vec::with_capacity(count.div_ceil(stride));
-    for n in notes[start..end].iter().step_by(stride) {
-        let (time, pos, size) = *n;
-        if !time.is_finite() || !pos.is_finite() || !size.is_finite() {
-            continue;
-        }
-        // 1 — нота на нижней кромке (момент t), 0 — только вошла сверху
-        let u = ((time - t) / lead).clamp(0.0, 1.0);
-        let anchor = top + (1.0 - u) * h;
-        // размер ноты обычно 1..2; толщина 9..14 px, длина 30..38 px —
-        // вытянутая «клавиша», а не квадрат, иначе фон читается как мусор UI
-        let sz = size.clamp(0.5, 2.0);
-        let bw = (5.0 + 4.5 * sz) * s;
-        let bh = (22.0 + 8.0 * sz) * s;
-        let cx = x0 + ((pos.clamp(-2.0, 2.0) + 2.0) / 4.0) * w;
-        let bx = (cx - bw * 0.5).clamp(x0, (x0 + w - bw).max(x0));
-        out.push([bx, anchor - bh, bw, bh]);
-    }
-    out
-}
-
-/// То же, что [`falling_keys`], но полосы — настоящие ноты песни, а их
-/// вертикальная позиция привязана к позиции превью. Альфа плавно проявляется
-/// у верхней кромки и тает к нижней, чтобы фон «дышал», а не стоял стеной.
+/// `dim` — необязательная зона `(rect, factor)`: квады, попавшие в неё,
+/// рисуются с приглушённой альфой. Нужна для титульного блока main-экрана,
+/// чтобы вордмарк оставался главным.
+///
+/// `link_clip` — необязательная область, в которой разрешены нити слайдов
+/// (например, колонка списка). Ноты могут быть шире, но длинные линии не
+/// должны перечёркивать заголовок или титульный блок.
 #[allow(clippy::too_many_arguments)]
-pub fn note_keys(
+pub fn chart_fall(
     ui: &mut Vec<UiQuad>,
     white: usize,
     rect: [f32; 4],
-    notes: &[(f32, f32, f32)],
-    t: f32,
-    lead: f32,
+    notes: &[BgNote],
+    now: f32,
     strength: f32,
     s: f32,
+    dim: Option<([f32; 4], f32)>,
+    link_clip: Option<[f32; 4]>,
 ) {
-    let (top, h) = (rect[1], rect[3]);
-    if strength <= 0.0 || h <= 0.0 {
+    let (x0, top, w, h) = (rect[0], rect[1], rect[2], rect[3]);
+    if w <= 0.0 || h <= 0.0 || strength <= 0.0 || notes.is_empty() {
         return;
     }
-    let (clip_top, clip_bottom) = (rect[1], rect[1] + rect[3]);
-    for r in note_key_rects(rect, notes, t, lead, s) {
-        let anchor = r[1] + r[3];
-        let u = ((anchor - top) / h).clamp(0.0, 1.0);
-        let fade = (u / 0.08).min(1.0) * ((1.0 - u) / 0.16).min(1.0);
-        let a = strength * fade;
-        if a <= 0.0 {
+    let bottom = top + h;
+    let dim_factor = |r: [f32; 4]| -> f32 {
+        match dim {
+            Some((d, k))
+                if r[0] + r[2] * 0.5 >= d[0]
+                    && r[0] + r[2] * 0.5 <= d[0] + d[2]
+                    && r[1] + r[3] * 0.5 >= d[1]
+                    && r[1] + r[3] * 0.5 <= d[1] + d[3] =>
+            {
+                k
+            }
+            _ => 1.0,
+        }
+    };
+    let stride = crate::bg::draw_stride(notes.len());
+    let mut bars: Vec<([f32; 4], Option<([f32; 2], [f32; 2])>)> =
+        Vec::with_capacity(notes.len() / stride + 1);
+    for n in notes.iter().step_by(stride) {
+        let anchor = crate::bg::note_y(rect, n.t, now);
+        let sz = n.size.clamp(0.5, 2.0);
+        // мини-нота, а не гистограммная палочка: заметная толщина, короткая
+        // длина; размер чарта меняет обе, но в пределах клампа
+        let bw = (8.0 + 7.0 * sz) * s;
+        let bh = (24.0 + 9.0 * sz) * s;
+        // верх полосы ниже нижней кромки — нота уже ушла; нижний край выше
+        // верхней кромки — ещё не вошла. Никаких фейдов на кромках.
+        if anchor < top || anchor - bh >= bottom {
             continue;
         }
-        let y0 = clip_top.max(r[1]);
-        let y1 = clip_bottom.min(anchor);
+        let cx = x0 + ((n.pos.clamp(-2.0, 2.0) + 2.0) / 4.0) * w;
+        let bx = (cx - bw * 0.5).clamp(x0, (x0 + w - bw).max(x0));
+        // Поле начинается под верхней панелью: полоса не имеет права
+        // выглядывать над top. Часть, вошедшая в кадр, обрезается по кромке,
+        // а не рисуется поверх header/search.
+        let bar_top = anchor - bh;
+        let y0 = bar_top.max(top);
+        let y1 = anchor.min(bottom);
         if y1 <= y0 {
             continue;
         }
-        fill(ui, white, [r[0], y0, r[2], y1 - y0], [0.84, 0.80, 0.72, a]);
-        // торец-«голова» ноты чуть ярче — тот же язык, что у случайных полос
-        let cap_y = (anchor - 2.0 * s).max(y0);
-        if y1 > cap_y {
-            fill(ui, white, [r[0], cap_y, r[2], y1 - cap_y], [0.84, 0.80, 0.72, (a * 1.8).min(1.0)]);
+        let bar = [bx, y0, bw, y1 - y0];
+        // Нить слайда: только короткая локальная диагональ. Оба конца должны
+        // быть в поле, а размах по вертикали и горизонтали — небольшим
+        // (LINK_SPAN). Связка из нескольких нот даёт несколько таких отрезков.
+        let link = n.next.and_then(|(npos, nt, nsize)| {
+            let nsz = nsize.clamp(0.5, 2.0);
+            let nbh = (24.0 + 9.0 * nsz) * s;
+            let nanchor = crate::bg::note_y(rect, nt, now);
+            let c1 = anchor - bh * 0.5;
+            let c2 = nanchor - nbh * 0.5;
+            let nx = x0 + ((npos.clamp(-2.0, 2.0) + 2.0) / 4.0) * w;
+            if c1 < top || c1 > bottom || c2 < top || c2 > bottom {
+                return None;
+            }
+            if nx < x0 || nx > x0 + w {
+                return None;
+            }
+            // нить не должна вылезать из разрешённой области (колонка списка):
+            // обе ноты обязаны быть в ней целиком
+            let clip = link_clip.unwrap_or(rect);
+            let (cx0, cy0, cw, ch) = (clip[0], clip[1], clip[2], clip[3]);
+            if cx < cx0 || cx > cx0 + cw || nx < cx0 || nx > cx0 + cw {
+                return None;
+            }
+            if c1 < cy0 || c1 > cy0 + ch || c2 < cy0 || c2 > cy0 + ch {
+                return None;
+            }
+            if (c2 - c1).abs() > h * LINK_SPAN || (nx - cx).abs() > w * LINK_SPAN {
+                return None;
+            }
+            Some(([cx, c1], [nx, c2]))
+        });
+        bars.push((bar, link));
+    }
+    // сначала нити (под нотами), потом сами полосы — как в игровом поле.
+    // Нить заметно бледнее нот: это подсказка о слайде, а не второй слой
+    // графики.
+    for (_, link) in &bars {
+        if let Some((p, q)) = link {
+            let mid = [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5];
+            let alpha = strength * 0.10 * dim_factor([mid[0], mid[1], 0.0, 0.0]);
+            ribbon(ui, white, *p, *q, s, [0.84, 0.80, 0.72, alpha]);
+        }
+    }
+    for (bar, _) in &bars {
+        let a = strength * dim_factor(*bar);
+        fill(ui, white, *bar, [0.84, 0.80, 0.72, a]);
+    }
+}
+
+/// Отрезок под произвольным углом: UI-квад не умеет поворот, поэтому линия
+/// собирается из полос, идущих вдоль доминирующей оси. Полосы стыкуются без
+/// наложения, иначе перекрытие альфы даёт «бусины» на прямой.
+fn ribbon(ui: &mut Vec<UiQuad>, white: usize, a: [f32; 2], b: [f32; 2], s: f32, color: [f32; 4]) {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    if dx.abs() < 0.5 && dy.abs() < 0.5 {
+        return;
+    }
+    let thick = (2.0 * s).max(1.0);
+    let band = (1.5 * s).max(1.0);
+    if dy.abs() >= dx.abs() {
+        // вертикальная доминанта: горизонтальные полосы, шаг по y
+        let (a, b) = if a[1] <= b[1] { (a, b) } else { (b, a) };
+        let h_total = b[1] - a[1];
+        let n = ((h_total / band).ceil() as usize).clamp(1, 240);
+        let h = h_total / n as f32;
+        for i in 0..n {
+            let u0 = i as f32 / n as f32;
+            let u1 = (i + 1) as f32 / n as f32;
+            let x0 = a[0] + (b[0] - a[0]) * u0;
+            let x1 = a[0] + (b[0] - a[0]) * u1;
+            fill(
+                ui,
+                white,
+                [
+                    x0.min(x1) - thick * 0.5,
+                    a[1] + h_total * u0,
+                    (x0 - x1).abs() + thick,
+                    h.max(0.5),
+                ],
+                color,
+            );
+        }
+    } else {
+        // горизонтальная доминанта: вертикальные полосы, шаг по x
+        let (a, b) = if a[0] <= b[0] { (a, b) } else { (b, a) };
+        let w_total = b[0] - a[0];
+        let n = ((w_total / band).ceil() as usize).clamp(1, 240);
+        let w = w_total / n as f32;
+        for i in 0..n {
+            let u0 = i as f32 / n as f32;
+            let u1 = (i + 1) as f32 / n as f32;
+            let y0 = a[1] + (b[1] - a[1]) * u0;
+            let y1 = a[1] + (b[1] - a[1]) * u1;
+            fill(
+                ui,
+                white,
+                [
+                    a[0] + w_total * u0,
+                    y0.min(y1) - thick * 0.5,
+                    w.max(0.5),
+                    (y0 - y1).abs() + thick,
+                ],
+                color,
+            );
         }
     }
 }
@@ -437,104 +524,111 @@ pub fn fade_y(ui: &mut Vec<UiQuad>, tex: usize, rect: [f32; 4], color: [f32; 4])
         color,
     });
 }
+
 #[cfg(test)]
 mod tests {
-    use super::{NOTE_KEY_MAX, NOTE_LEAD, note_key_rects};
+    use super::chart_fall;
+    use crate::bg::BgNote;
 
-    const RECT: [f32; 4] = [100.0, 50.0, 400.0, 300.0];
+    const RECT: [f32; 4] = [0.0, 50.0, 400.0, 300.0];
 
-    fn bottom(r: [f32; 4]) -> f32 {
-        r[1] + r[3]
-    }
-
-    #[test]
-    fn note_at_now_lands_on_the_bottom_edge() {
-        let r = note_key_rects(RECT, &[(10.0, 0.0, 1.0)], 10.0, NOTE_LEAD, 1.0);
-        assert_eq!(r.len(), 1);
-        assert!(
-            (bottom(r[0]) - (RECT[1] + RECT[3])).abs() < 1e-3,
-            "note at t must sit on the bottom edge, got {}",
-            bottom(r[0])
-        );
-    }
-
-    #[test]
-    fn note_at_lead_lands_on_the_top_edge() {
-        // нота через lead секунд — уже у верхней кромки
-        let r = note_key_rects(RECT, &[(10.0 + NOTE_LEAD, 0.0, 1.0)], 10.0, NOTE_LEAD, 1.0);
-        assert_eq!(r.len(), 1);
-        assert!(
-            (bottom(r[0]) - RECT[1]).abs() < 1e-3,
-            "note at t+lead must sit on the top edge, got {}",
-            bottom(r[0])
-        );
-    }
-
-    #[test]
-    fn time_maps_monotonically_between_edges() {
-        let notes = [(10.0, 0.0, 1.0), (11.0, 0.0, 1.0), (12.0, 0.0, 1.0)];
-        let r = note_key_rects(RECT, &notes, 10.0, NOTE_LEAD, 1.0);
-        assert_eq!(r.len(), 3);
-        // более поздняя нота всегда выше (y меньше)
-        assert!(bottom(r[0]) > bottom(r[1]));
-        assert!(bottom(r[1]) > bottom(r[2]));
-    }
-
-    #[test]
-    fn pos_maps_left_to_right_and_clamps_past_two() {
-        let notes = [(11.0, -3.0, 1.0), (11.0, -1.0, 1.0), (11.0, 0.0, 1.0), (11.0, 1.0, 1.0), (11.0, 3.0, 1.0)];
-        let r = note_key_rects(RECT, &notes, 10.0, NOTE_LEAD, 1.0);
-        assert_eq!(r.len(), 5);
-        for pair in r.windows(2) {
-            assert!(pair[0][0] < pair[1][0], "pos must map left → right");
+    fn note(t: f32) -> BgNote {
+        BgNote {
+            t,
+            pos: 0.0,
+            size: 1.0,
+            next: None,
         }
-        // |pos| > 2 упирается в те же края, что и ровно ±2
-        let edge = note_key_rects(
+    }
+
+    #[test]
+    fn note_is_one_flat_quad_without_cap_or_ramp() {
+        let mut ui = Vec::new();
+        chart_fall(&mut ui, 1, RECT, &[note(10.0)], 10.0, 0.1, 1.0, None, None);
+        assert_eq!(ui.len(), 1, "a note must be one flat rectangle, not a body + head");
+        assert_eq!(ui[0].color[3], 0.1, "uniform ink: no per-bar alpha ramp");
+    }
+
+    #[test]
+    fn note_past_the_bottom_is_gone_not_clamped() {
+        let mut ui = Vec::new();
+        // кромка: полоса ещё видна и не обрезана внутренним rect
+        chart_fall(&mut ui, 1, RECT, &[note(10.0)], 10.1, 0.1, 1.0, None, None);
+        assert_eq!(ui.len(), 1);
+        assert!(ui[0].rect[1] > RECT[1] + RECT[3] - 60.0);
+        // ушла целиком — не рисуем вовсе
+        ui.clear();
+        chart_fall(&mut ui, 1, RECT, &[note(10.0)], 11.0, 0.1, 1.0, None, None);
+        assert!(ui.is_empty(), "a note below the region must vanish, not stick to an edge");
+    }
+
+    #[test]
+    fn bar_enters_below_the_top_edge_without_touching_the_header() {
+        let mut ui = Vec::new();
+        // нота ровно на верхней кромке поля: её полоса целиком выше кадра
+        chart_fall(&mut ui, 1, RECT, &[note(12.0)], 10.0, 0.1, 1.0, None, None);
+        assert!(ui.is_empty(), "a note at the top edge must not paint into the header");
+        // чуть ниже: видимая часть обрезана по top, а не торчит над ним
+        ui.clear();
+        chart_fall(&mut ui, 1, RECT, &[note(11.9)], 10.0, 0.1, 1.0, None, None);
+        assert_eq!(ui.len(), 1);
+        assert!(
+            ui[0].rect[1] >= RECT[1] - 1e-3,
+            "bar top {} must stay below field top {}",
+            ui[0].rect[1],
+            RECT[1]
+        );
+        assert!(
+            ui[0].rect[1] + ui[0].rect[3] <= RECT[1] + RECT[3] + 1e-3,
+            "bar must stay inside the field"
+        );
+    }
+
+    #[test]
+    fn slide_draws_the_note_and_a_faint_local_connector() {
+        let mut ui = Vec::new();
+        let mut n = note(10.0);
+        n.next = Some((1.0, 10.3, 1.0));
+        chart_fall(&mut ui, 1, RECT, &[n], 10.0, 0.1, 1.0, None, None);
+        assert!(ui.len() > 1, "connector must add quads under the bar");
+        // последний квад — сама нота поверх нити, нить заметно бледнее
+        let last = ui.last().unwrap();
+        assert_eq!(last.color[3], 0.1);
+        assert!(last.rect[3] > 20.0);
+        assert!(
+            ui[0].color[3] < last.color[3] * 0.2,
+            "ribbon must be much lower alpha than the notes"
+        );
+    }
+
+    #[test]
+    fn screen_spanning_slide_is_skipped() {
+        let mut ui = Vec::new();
+        let mut n = note(10.0);
+        // прыжок через пол-поля: такая «царапина» через весь экран не рисуется
+        n.next = Some((2.0, 10.3, 1.0));
+        chart_fall(&mut ui, 1, RECT, &[n], 10.0, 0.1, 1.0, None, None);
+        assert_eq!(ui.len(), 1, "only the note bar remains");
+    }
+
+    #[test]
+    fn connector_outside_the_link_clip_is_skipped() {
+        let mut ui = Vec::new();
+        let mut n = note(10.0);
+        n.next = Some((1.0, 10.3, 1.0));
+        // обе ноты в поле, но вторая — уже за разрешённой колонкой списка
+        chart_fall(
+            &mut ui,
+            1,
             RECT,
-            &[(11.0, -2.0, 1.0), (11.0, 2.0, 1.0)],
+            &[n],
             10.0,
-            NOTE_LEAD,
+            0.1,
             1.0,
+            None,
+            Some([0.0, 50.0, 250.0, 300.0]),
         );
-        assert!((r[0][0] - edge[0][0]).abs() < 1e-3);
-        assert!((r[4][0] - edge[1][0]).abs() < 1e-3);
-        // и не вылезает за rect по горизонтали
-        for q in &r {
-            assert!(q[0] >= RECT[0] - 1e-3);
-            assert!(q[0] + q[2] <= RECT[0] + RECT[2] + 1e-3);
-        }
-    }
-
-    #[test]
-    fn notes_outside_the_window_are_skipped() {
-        let notes = [
-            (9.0, 0.0, 1.0),                          // уже позади (t - 1.0)
-            (11.0, 0.0, 1.0),                         // в окне
-            (10.0 + NOTE_LEAD + 0.5, 0.0, 1.0),       // ещё слишком далеко
-        ];
-        let r = note_key_rects(RECT, &notes, 10.0, NOTE_LEAD, 1.0);
-        assert_eq!(r.len(), 1, "only the note inside the window is drawn");
-        assert!((bottom(r[0]) - (RECT[1] + RECT[3] * (1.0 - 1.0 / NOTE_LEAD))).abs() < 1e-3);
-    }
-
-    #[test]
-    fn empty_input_gives_empty_output() {
-        assert!(note_key_rects(RECT, &[], 10.0, NOTE_LEAD, 1.0).is_empty());
-        // вырожденный rect тоже ничего не рисует
-        assert!(note_key_rects([0.0, 0.0, 0.0, 300.0], &[(10.0, 0.0, 1.0)], 10.0, NOTE_LEAD, 1.0).is_empty());
-        assert!(note_key_rects([0.0, 0.0, 400.0, 0.0], &[(10.0, 0.0, 1.0)], 10.0, NOTE_LEAD, 1.0).is_empty());
-    }
-
-    #[test]
-    fn dense_chart_is_capped_per_frame() {
-        let notes: Vec<(f32, f32, f32)> = (0..500)
-            .map(|i| (10.0 + i as f32 * NOTE_LEAD / 600.0, (i % 5) as f32 - 2.0, 1.0))
-            .collect();
-        let r = note_key_rects(RECT, &notes, 10.0, NOTE_LEAD, 1.0);
-        assert!(!r.is_empty());
-        assert!(r.len() <= NOTE_KEY_MAX, "cap must hold, got {}", r.len());
-        // выборка всё ещё покрывает всё окно, а не только начало
-        assert!(bottom(r[0]) > RECT[1] + RECT[3] * 0.85);
-        assert!(bottom(r[r.len() - 1]) < RECT[1] + RECT[3] * 0.2);
+        assert_eq!(ui.len(), 1, "a ribbon must not leave the list column");
     }
 }
+

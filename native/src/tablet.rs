@@ -48,6 +48,11 @@ pub struct Tablets {
     /// самый свежий репорт: (какой планшет, когда). Gaomon и Parblo равноправны:
     /// игра берёт активный планшет, а не жёстко Parblo.
     active: Arc<Mutex<Option<(&'static str, Instant)>>>,
+    /// Момент последнего отчёта любого планшета — нужен, чтобы отличить
+    /// эмулированную мышку (перо) от настоящей.
+    last_report: Arc<Mutex<Option<Instant>>>,
+    /// Момент последнего нажатия пером.
+    last_press: Arc<Mutex<Option<Instant>>>,
     log: Arc<Mutex<File>>,
     events: Arc<Mutex<Vec<RawTabletEvent>>>,
     start: Instant,
@@ -55,6 +60,61 @@ pub struct Tablets {
 
 /// Сколько живёт «активность» планшета без новых репортов.
 pub const ACTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Свежесть нажатия пера, при которой его эмулированная мышь игнорируется.
+pub const PEN_PRESS_GRACE: std::time::Duration = std::time::Duration::from_millis(80);
+/// Свежесть любого репорта пера для проверки близости курсора.
+pub const PEN_REPORT_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+/// Допуск совпадения X пера и системного курсора (доля ширины окна).
+pub const PEN_X_TOLERANCE: f32 = 0.02;
+
+/// Свежий ли отчёт: `last` не старше `within` на момент `now`.
+///
+/// Вынесено отдельно от мьютексов, чтобы окно свежести можно было проверить
+/// тестом без реального hidraw-устройства.
+pub fn report_is_fresh(
+    last: Option<Instant>,
+    within: std::time::Duration,
+    now: Instant,
+) -> bool {
+    last.is_some_and(|t| now.saturating_duration_since(t) <= within)
+}
+
+/// Совпадает ли эмулированный пером курсор с позицией пера.
+///
+/// `pen_x_norm` — X пера, нормализованный в 0..1 по ширине планшета;
+/// `cursor_x` — X системного курсора в пикселях окна.
+pub fn pen_matches_cursor(pen_x_norm: f32, cursor_x: f32, width: f32, tol: f32) -> bool {
+    if !pen_x_norm.is_finite()
+        || !cursor_x.is_finite()
+        || !width.is_finite()
+        || width <= 0.0
+        || !tol.is_finite()
+        || tol < 0.0
+    {
+        return false;
+    }
+    (pen_x_norm * width - cursor_x).abs() <= tol * width
+}
+
+/// Чистое решение «это событие мыши сгенерировало перо, а не настоящая мышь».
+///
+/// `press_recently` / `pen_down` — факты из [`Tablets`], `report` — уже
+/// отфильтрованное по свежести состояние пера. Отдельная функция нужна, чтобы
+/// проверить все ветки без GPU/окна/планшета.
+pub fn pen_emulates_mouse(
+    press_recently: bool,
+    pen_down: bool,
+    report: Option<TabletState>,
+    cursor_x: f32,
+    width: f32,
+) -> bool {
+    if press_recently || pen_down {
+        return true;
+    }
+    report.is_some_and(|st| {
+        st.present && pen_matches_cursor(st.x_norm, cursor_x, width, PEN_X_TOLERANCE)
+    })
+}
 
 fn vidpid(node: &str) -> (String, String) {
     let base = node.rsplit('/').next().unwrap_or("");
@@ -104,6 +164,8 @@ impl Tablets {
             gaomon: Arc::new(Mutex::new(TabletState::default())),
             parblo: Arc::new(Mutex::new(TabletState::default())),
             active: Arc::new(Mutex::new(None)),
+            last_report: Arc::new(Mutex::new(None)),
+            last_press: Arc::new(Mutex::new(None)),
             log: Arc::new(Mutex::new(log)),
             events: Arc::new(Mutex::new(Vec::new())),
             start: Instant::now(),
@@ -131,6 +193,8 @@ impl Tablets {
     ) {
         let log = self.log.clone();
         let events = self.events.clone();
+        let last_report = self.last_report.clone();
+        let last_press = self.last_press.clone();
         let active = self.active.clone();
         let start = self.start;
         std::thread::spawn(move || {
@@ -164,6 +228,14 @@ impl Tablets {
                 // зона уменьшена в zoom раз, центр сохранён
                 let xn = (((x as f32 / x_max) - 0.5) * zoom + 0.5).clamp(0.0, 1.0);
                 let press = !hover && p > press_threshold;
+                if let Ok(mut g) = last_report.lock() {
+                    *g = Some(Instant::now());
+                }
+                if press {
+                    if let Ok(mut g) = last_press.lock() {
+                        *g = Some(Instant::now());
+                    }
+                }
                 {
                     let mut s = state.lock().unwrap();
                     *s = TabletState {
@@ -246,9 +318,94 @@ impl Tablets {
             None
         }
     }
+    /// Был ли отчёт пера не позже `within` назад.
+    pub fn pen_report_within(&self, within: std::time::Duration) -> Option<TabletState> {
+        let last = *self.last_report.lock().ok()?;
+        if !report_is_fresh(last, within, Instant::now()) {
+            return None;
+        }
+        self.active_state()
+    }
+
+    /// Нажимало ли перо не позже `within` назад.
+    pub fn pen_pressed_within(&self, within: std::time::Duration) -> bool {
+        let last = self.last_press.lock().ok().and_then(|g| *g);
+        report_is_fresh(last, within, Instant::now())
+    }
+
+    /// Нажато ли перо прямо сейчас (на активном планшете).
+    pub fn pen_down(&self) -> bool {
+        self.active_state().map(|s| s.press).unwrap_or(false)
+    }
+
     /// Забрать накопленные сырые репорты (для реплея).
     pub fn drain(&self) -> Vec<RawTabletEvent> {
         let mut q = self.events.lock().unwrap();
         std::mem::take(&mut *q)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{
+        PEN_REPORT_GRACE, PEN_X_TOLERANCE, TabletState, pen_emulates_mouse, pen_matches_cursor,
+        report_is_fresh,
+    };
+    use std::time::{Duration, Instant};
+
+    fn pen(x_norm: f32) -> TabletState {
+        TabletState {
+            present: true,
+            x_norm,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_tablet_data_never_emulates_mouse() {
+        assert!(!pen_emulates_mouse(false, false, None, 640.0, 1280.0));
+    }
+
+    #[test]
+    fn recent_pen_press_is_filtered() {
+        assert!(pen_emulates_mouse(true, false, None, 640.0, 1280.0));
+        // курсор может быть где угодно: свежее нажатие важнее
+        assert!(pen_emulates_mouse(true, false, None, 10.0, 1280.0));
+    }
+
+    #[test]
+    fn pen_held_down_is_filtered() {
+        assert!(pen_emulates_mouse(false, true, None, 10.0, 1280.0));
+    }
+
+    #[test]
+    fn cursor_pen_proximity_matches_only_within_tolerance() {
+        let w = 1280.0;
+        // ровно в пере
+        assert!(pen_emulates_mouse(false, false, Some(pen(0.5)), 640.0, w));
+        // 0.5 % ширины от пера — ещё «та же точка»
+        assert!(pen_emulates_mouse(false, false, Some(pen(0.505)), 640.0, w));
+        // 5 % — уже настоящая мышь
+        assert!(!pen_emulates_mouse(false, false, Some(pen(0.55)), 640.0, w));
+        assert!(!pen_emulates_mouse(false, false, Some(pen(0.45)), 640.0, w));
+    }
+
+    #[test]
+    fn stale_report_does_not_match() {
+        let now = Instant::now();
+        assert!(report_is_fresh(Some(now), PEN_REPORT_GRACE, now));
+        assert!(!report_is_fresh(
+            now.checked_sub(Duration::from_millis(100)).map(Some).unwrap_or(None),
+            PEN_REPORT_GRACE,
+            now
+        ));
+        // старый отчёт caller уже отбросил -> None
+        assert!(!pen_emulates_mouse(false, false, None, 640.0, 1280.0));
+    }
+
+    #[test]
+    fn proximity_rejects_degenerate_input() {
+        assert!(!pen_matches_cursor(0.5, 640.0, 0.0, PEN_X_TOLERANCE));
+        assert!(!pen_matches_cursor(0.5, 640.0, 1280.0, -0.1));
+        assert!(pen_matches_cursor(0.5, 640.0, 1280.0, PEN_X_TOLERANCE));
     }
 }
