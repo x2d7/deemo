@@ -1,10 +1,19 @@
 # deemo
 
-A Deemo-style rhythm game for Linux: a song library with previews and records,
+A Deemo-style rhythm game for PC (Linux): a song library with previews and records,
 falling-note play at the judge line, and a result screen with a tap-timing
 histogram.
 
 A chart server can be connected for uploading and downloading charts.
+
+## Two cursors
+
+The game is played with two cursors at once — the mouse and a pen on a graphics
+tablet, each judged separately.
+
+A graphics tablet is needed to control the left cursor. Tablet support is at an
+early stage: only a few models are mapped so far, and the list keeps growing —
+see [TABLETS.md](TABLETS.md).
 
 ![song select](screenshots/main.png)
 
