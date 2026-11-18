@@ -891,13 +891,26 @@ pub struct ResultView<'a> {
     pub play: &'a crate::play::Play,
     pub rank: &'a str,
     pub is_record: bool,
-    pub recommended: f32,
-    pub mouse_rec: f32,
-    pub tablet_rec: f32,
-    pub mouse_off: f32,
-    pub tablet_off: f32,
+    /// Рекомендация локального оффсета карты по этому плею (мс);
+    /// None — у устройства не было тапов (в UI «—»).
+    pub map_mouse: Option<f32>,
+    pub map_tablet: Option<f32>,
+    /// Уже применённые локальные оффсеты этой карты (мс).
+    pub local_mouse: f32,
+    pub local_tablet: f32,
+    /// Глобальные оффсеты ввода из настроек (добавляются к локальным).
+    pub global_mouse: f32,
+    pub global_tablet: f32,
     pub mouse_errs: &'a [f32],
     pub tablet_errs: &'a [f32],
+}
+
+/// `+7` / `−3` / `—` (нет тапов в этом прохождении).
+fn fmt_offset(ms: Option<f32>) -> String {
+    match ms {
+        Some(v) => format!("{:+}", v.round() as i32),
+        None => "—".to_string(),
+    }
 }
 
 pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
@@ -978,17 +991,26 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
     draw_histogram(ctx, ui, v.mouse_errs, hx, each, y(400.0), z(110.0), "MOUSE · TAPS", k);
     draw_histogram(ctx, ui, v.tablet_errs, hx + each + gap, each, y(400.0), z(110.0), "TABLET · TAPS", k);
 
-    // кнопка установки оффсета
+    // кнопка установки локального (на карту) оффсета
     let r = result_layout(w, h).apply_btn;
     theme::fill(ui, white, r, PANEL);
     theme::frame(ui, white, r, [0.69, 0.44, 0.12, 0.72], k);
     theme::corner_ticks(ui, white, r, ACCENT, 12.0 * k, k);
-    let label = format!("ACCEPT OFFSET  {:+} MS", v.recommended.round() as i32);
+    let label = format!(
+        "APPLY MAP OFFSET  mouse {} · tablet {} MS",
+        fmt_offset(v.map_mouse),
+        fmt_offset(v.map_tablet)
+    );
     text.draw_centered_tracked(Face::Serif, &label, r[0] + r[2] * 0.5, r[1] + (r[3] - z(11.0)) * 0.5, z(11.0), 2.2 * k, INK_HI, ui);
 
     let line = format!(
-        "split (F3): mouse {:+.0} · tablet {:+.0} ms   [now {:+.0}/{:+.0}]",
-        v.mouse_rec, v.tablet_rec, v.mouse_off, v.tablet_off
+        "local {:+.0}/{:+.0} · global {:+.0}/{:+.0} · this play {} / {} ms",
+        v.local_mouse,
+        v.local_tablet,
+        v.global_mouse,
+        v.global_tablet,
+        fmt_offset(v.map_mouse),
+        fmt_offset(v.map_tablet)
     );
     text.draw_centered(&line, cx, r[1] + r[3] + z(12.0), z(10.0), INK_DIM, ui);
 
@@ -1200,4 +1222,18 @@ pub fn draw_toast(ctx: &Ctx, ui: &mut Vec<UiQuad>, msg: &str, alpha: f32) {
     theme::frame(ui, white, r, [0.84, 0.80, 0.72, 0.28 * alpha], s);
     theme::fill(ui, white, [r[0], r[1], 2.0 * s, r[3]], [ACCENT[0], ACCENT[1], ACCENT[2], alpha]);
     text.draw_centered(msg, w * 0.5, r[1] + 8.0 * s, 11.5 * s, [0.84, 0.80, 0.72, alpha], ui);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_offset;
+
+    /// Подписи локального оффсета на результате: знак и «—» без тапов.
+    #[test]
+    fn map_offset_labels() {
+        assert_eq!(fmt_offset(Some(7.0)), "+7");
+        assert_eq!(fmt_offset(Some(-3.0)), "-3");
+        assert_eq!(fmt_offset(Some(0.0)), "+0");
+        assert_eq!(fmt_offset(None), "—");
+    }
 }

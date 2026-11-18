@@ -222,16 +222,19 @@ pub struct App {
     fullscreen: bool,
     tablet_zoom: f32,
     audio_offset_ms: f32,
-    /// рекомендованный оффсет, вычисленный один раз при входе в результат
-    result_recommended: f32,
     /// последний результат — новый рекорд?
     result_is_record: bool,
     /// ошибки тапов по устройствам (без слайдеров) для раздельной калибровки
     mouse_tap_errors: Vec<f32>,
     tablet_tap_errors: Vec<f32>,
-    /// раздельные рекомендации оффсета (мс), вычисленные на результате
-    result_mouse_rec: f32,
-    result_tablet_rec: f32,
+    /// локальные оффсеты ввода на карту (song:diff), раздельно мышь/планшет
+    map_offsets: crate::map_offsets::MapOffsets,
+    /// ключ текущей карты (id песни, имя сложности) для map_offsets
+    play_key: (String, String),
+    /// рекомендации локального оффсета по этому плею (кнопка результата / F3);
+    /// None — у устройства не было тапов, значение карты не меняется
+    result_map_mouse: Option<f32>,
+    result_map_tablet: Option<f32>,
     /// горизонтальный допуск тапа (мировые ед.)
     x_tolerance: f32,
     /// мышь: абсолютная позиция курсора вместо относительного delta
@@ -378,12 +381,13 @@ impl App {
             fullscreen: settings.fullscreen,
             tablet_zoom: settings.tablet_zoom,
             audio_offset_ms: settings.audio_offset_ms,
-            result_recommended: 0.0,
             result_is_record: false,
             mouse_tap_errors: Vec::new(),
             tablet_tap_errors: Vec::new(),
-            result_mouse_rec: 0.0,
-            result_tablet_rec: 0.0,
+            map_offsets: crate::map_offsets::MapOffsets::load(),
+            play_key: (String::new(), String::new()),
+            result_map_mouse: None,
+            result_map_tablet: None,
             full_rx: None,
             full_pending: None,
             full_loaded: None,
@@ -565,9 +569,15 @@ impl App {
         let Some(c) = self.songs[song].charts.get(diff) else {
             return;
         };
-        let Ok(chart) = Chart::load(&c.path) else {
+        let chart_path = c.path.clone();
+        let chart_diff = c.diff.clone();
+        let Ok(chart) = Chart::load(&chart_path) else {
             return;
         };
+        let song_id = self.songs[song].id.clone();
+        // локальные оффсеты карты относятся к song:diff — фиксируем ключ на всё
+        // время плея (результат и кнопка на нём используют тот же ключ)
+        self.play_key = (song_id.clone(), chart_diff.clone());
         let mut play = Play::new(&chart);
         play.set_x_tolerance(self.x_tolerance);
         // lead-in: ноты успевают упасть сверху до первой ноты
@@ -575,8 +585,8 @@ impl App {
         let clock = Clock::new(lead_in, self.audio_offset_ms / 1000.0);
         // реплей: пишем сырой ввод всей сессии (сохранение по F2)
         self.replay = Some(crate::replay::Replay::new(
-            &self.songs[song].id,
-            &c.diff,
+            &song_id,
+            &chart_diff,
             &self.songs[song].title,
             &chart,
             self.speed,
@@ -584,8 +594,9 @@ impl App {
             self.tablet_zoom,
             self.x_tolerance,
         ));
+        let (input_mouse, input_tablet) = self.input_offsets();
         if let Some(r) = &mut self.replay {
-            r.set_input_offsets(self.mouse_offset_ms, self.tablet_offset_ms);
+            r.set_input_offsets(input_mouse, input_tablet);
         }
         self.music_gain = 1.0;
         if let Some(g) = self.gfx.as_mut() {
@@ -1480,18 +1491,11 @@ impl App {
                     }
                 }
             }
-            // F3 — применить раздельные оффсеты мыши/планшета (на результате)
+            // F3 — применить локальные оффсеты карты (на результате): пишутся в
+            // data/offsets.json и действуют на следующих плеях этой карты
             Key::Named(NamedKey::F3) => {
                 if matches!(self.mode, Mode::Result { .. }) {
-                    self.mouse_offset_ms = self.result_mouse_rec;
-                    self.tablet_offset_ms = self.result_tablet_rec;
-                    self.save_settings();
-                    let msg = format!(
-                        "Offsets: mouse {:+.0} · tablet {:+.0} ms",
-                        self.mouse_offset_ms, self.tablet_offset_ms
-                    );
-                    println!("{msg}");
-                    self.toast = Some((msg, Instant::now()));
+                    self.apply_map_offsets();
                 }
             }
             // G — переключить направляющие линии от нот (вне библиотеки)
@@ -1566,6 +1570,21 @@ impl App {
         crate::settings::save(&self.snapshot_settings());
     }
 
+    /// Локальный оффсет текущей карты для устройства (мс), 0 если карты нет.
+    fn map_local_ms(&self, device: usize) -> f32 {
+        let (song, diff) = &self.play_key;
+        self.map_offsets.local_ms(song, diff, device)
+    }
+
+    /// Оффсет ввода, реально применяемый в игре: глобальная настройка +
+    /// локальная поправка карты. Возвращает (мышь, планшет), мс.
+    fn input_offsets(&self) -> (f32, f32) {
+        (
+            self.mouse_offset_ms + self.map_local_ms(crate::map_offsets::MOUSE),
+            self.tablet_offset_ms + self.map_local_ms(crate::map_offsets::TABLET),
+        )
+    }
+
     fn apply_music_volume(&self) {
         if let Some(g) = self.gfx.as_ref() {
             g.music.set_volume(self.volume * self.music_gain);
@@ -1591,8 +1610,9 @@ impl App {
             self.set_fullscreen(s.fullscreen);
         }
         self.apply_music_volume();
+        let (input_mouse, input_tablet) = self.input_offsets();
         if let Some(r) = &mut self.replay {
-            r.set_input_offsets(self.mouse_offset_ms, self.tablet_offset_ms);
+            r.set_input_offsets(input_mouse, input_tablet);
         }
         // на паузе X-допуск можно поправить и для текущей песни
         if let Mode::Play { play, .. } = &mut self.mode {
@@ -2124,18 +2144,22 @@ impl App {
                 _ => 0.0,
             };
             let x = self.mouse_x;
-            let tj = t + self.mouse_offset_ms / 1000.0;
+            // эффективный оффсет мыши = глобальная настройка + локальная карта
+            let (input_mouse, _) = self.input_offsets();
+            let tj = t + input_mouse / 1000.0;
             let mut judge = None;
             let mut err_ms = 0.0;
             if let Mode::Play { chart, play, paused, .. } = &mut self.mode {
                 if !*paused {
                     judge = play.tap(chart, tj, x);
-                    if judge.is_some() {
+                    // в выборку калибровки идут только попадания: у Miss
+                    // `errors.last()` — это ошибка ПРЕДЫДУЩЕЙ ноты
+                    if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
                         err_ms = play.errors.last().copied().unwrap_or(0.0) * 1000.0;
                     }
                 }
             }
-            if judge.is_some() {
+            if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
                 self.mouse_tap_errors.push(err_ms);
             }
             if let Some(r) = &mut self.replay {
@@ -2146,9 +2170,8 @@ impl App {
         if matches!(self.mode, Mode::Result { .. }) {
             let r = self.apply_button_rect();
             if in_rect(px, py, r) {
-                // установить зафиксированную цель (идемпотентно, не накапливает)
-                self.audio_offset_ms = self.result_recommended;
-                self.save_settings();
+                // запомнить локальные оффсеты этой карты (глобальные не трогаем)
+                self.apply_map_offsets();
                 return;
             }
             self.to_library();
@@ -2306,6 +2329,9 @@ impl App {
             .map(|p| (p.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0));
         // сырые репорты планшетов за кадр (для реплея и тапов)
         let tablet_events = self.tablets.as_ref().map(|t| t.drain()).unwrap_or_default();
+        // эффективные оффсеты ввода: глобальные настройки + локальные карты
+        // (одни и те же для тапов и слайдов обоих устройств)
+        let (input_mouse, input_tablet) = self.input_offsets();
         let mut to_result = None;
         if let Mode::Play { chart, play, paused, song, diff, clock, music_on } = &mut self.mode {
             if !*paused {
@@ -2318,8 +2344,8 @@ impl App {
                 let t = clock.time(g.music.time(), *music_on);
                 play.update(chart, t);
                 // раздельные оффсеты ввода: + сдвигает тап/слайд позже
-                let tm = t + self.mouse_offset_ms / 1000.0;
-                let tt = t + self.tablet_offset_ms / 1000.0;
+                let tm = t + input_mouse / 1000.0;
+                let tt = t + input_tablet / 1000.0;
                 // сырой планшет в реплей + тапы по press-edges (без покадровой
                 // задержки); у каждого планшета СВОЙ prev_press
                 let mut prev = [self.gaomon_was_pressed, self.parblo_was_pressed];
@@ -2335,14 +2361,16 @@ impl App {
                     };
                     if tap_edge(&mut prev[slot], e.press) {
                         let px = (e.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0);
-                        let tj = et + self.tablet_offset_ms / 1000.0;
+                        let tj = et + input_tablet / 1000.0;
                         let j = play.tap(chart, tj, px);
-                        let err = if j.is_some() {
+                        // только попадания: у Miss ошибка от прошлой ноты
+                        let hit = matches!(j, Some(Judge::Perfect) | Some(Judge::Good));
+                        let err = if hit {
                             play.errors.last().copied().unwrap_or(0.0) * 1000.0
                         } else {
                             0.0
                         };
-                        if j.is_some() {
+                        if hit {
                             self.tablet_tap_errors.push(err);
                         }
                         if let Some(r) = &mut self.replay {
@@ -2387,32 +2415,36 @@ impl App {
         }
         if let Some((song, diff, play)) = to_result {
             self.gfx.as_ref().unwrap().music.pause();
-            // глобальная рекомендация — по ТАПАМ (без слайдеров: их ошибка механическая)
-            self.result_recommended =
-                crate::results::recommended_offset(self.audio_offset_ms, play.mean_tap_error() * 1000.0);
-            // раздельные рекомендации: центрируем тайминг каждого устройства (offset − mean_err)
-            let mean_of = |v: &[f32]| -> Option<f32> {
-                if v.is_empty() { None } else { Some(v.iter().sum::<f32>() / v.len() as f32) }
-            };
-            self.result_mouse_rec = match mean_of(&self.mouse_tap_errors) {
-                Some(m) => (self.mouse_offset_ms - m).clamp(-80.0, 80.0),
-                None => self.mouse_offset_ms,
-            };
-            self.result_tablet_rec = match mean_of(&self.tablet_tap_errors) {
-                Some(m) => (self.tablet_offset_ms - m).clamp(-80.0, 80.0),
-                None => self.tablet_offset_ms,
-            };
-            // сохраняем лучший результат локально
             let diff_name = self.songs[song]
                 .charts
                 .get(diff)
                 .map(|c| c.diff.clone())
                 .unwrap_or_default();
-            self.result_is_record = self.results.record(&self.songs[song].id, &diff_name, &play, self.speed);
+            let song_id = self.songs[song].id.clone();
+            self.play_key = (song_id.clone(), diff_name.clone());
+            // Локальный оффсет карты: рекомендация по ОДНОМУ этому плею —
+            // текущее локальное значение + средняя ошибка тапов устройства.
+            // Устройство без тапов в этом прохождении не получает предложения («—»).
+            let mean_of = |v: &[f32]| -> Option<f32> {
+                if v.is_empty() { None } else { Some(v.iter().sum::<f32>() / v.len() as f32) }
+            };
+            let mouse_mean = mean_of(&self.mouse_tap_errors);
+            let tablet_mean = mean_of(&self.tablet_tap_errors);
+            self.result_map_mouse = self
+                .map_offsets
+                .recommend(&song_id, &diff_name, crate::map_offsets::MOUSE, mouse_mean);
+            self.result_map_tablet = self.map_offsets.recommend(
+                &song_id,
+                &diff_name,
+                crate::map_offsets::TABLET,
+                tablet_mean,
+            );
+            // сохраняем лучший результат локально
+            self.result_is_record = self.results.record(&song_id, &diff_name, &play, self.speed);
             // онлайн: рекорд сначала в очередь на диск, отправка — в фоне
             if let Some(rec) =
                 self.online
-                    .pending_score(&self.songs[song].id, &diff_name, &play, self.speed)
+                    .pending_score(&song_id, &diff_name, &play, self.speed)
             {
                 let server = rec.server.clone();
                 let seq = self.queue.enqueue(rec.clone(), &server);
@@ -2426,9 +2458,12 @@ impl App {
                 use std::io::Write;
                 let _ = writeln!(
                     f,
-                    "{{\"offset_ms\":{},\"mean_ms\":{},\"median_ms\":{},\"n\":{},\"errors_ms\":{:?}}}",
+                    "{{\"offset_ms\":{},\"map_mouse_ms\":{},\"map_tablet_ms\":{},\"mean_ms\":{},\"mean_tap_ms\":{},\"median_ms\":{},\"n\":{},\"errors_ms\":{:?}}}",
                     self.audio_offset_ms,
+                    self.map_local_ms(crate::map_offsets::MOUSE),
+                    self.map_local_ms(crate::map_offsets::TABLET),
                     play.mean_error() * 1000.0,
+                    play.mean_tap_error() * 1000.0,
                     play.median_error() * 1000.0,
                     play.errors.len(),
                     play.errors.iter().map(|e| (e * 1000.0).round() as i32).collect::<Vec<_>>()
@@ -2865,15 +2900,71 @@ impl App {
             play,
             rank,
             is_record: self.result_is_record,
-            recommended: self.result_recommended,
-            mouse_rec: self.result_mouse_rec,
-            tablet_rec: self.result_tablet_rec,
-            mouse_off: self.mouse_offset_ms,
-            tablet_off: self.tablet_offset_ms,
+            map_mouse: self.result_map_mouse,
+            map_tablet: self.result_map_tablet,
+            local_mouse: self.map_offsets.local_ms(
+                &self.songs[song].id,
+                &diff_name,
+                crate::map_offsets::MOUSE,
+            ),
+            local_tablet: self.map_offsets.local_ms(
+                &self.songs[song].id,
+                &diff_name,
+                crate::map_offsets::TABLET,
+            ),
+            global_mouse: self.mouse_offset_ms,
+            global_tablet: self.tablet_offset_ms,
             mouse_errs: &self.mouse_tap_errors,
             tablet_errs: &self.tablet_tap_errors,
         };
         screens::draw_result(&ctx, &view, ui);
+    }
+
+    /// Применить локальные оффсеты карты с экрана результата (кнопка / F3).
+    ///
+    /// Глобальные `mouse_offset_ms`/`tablet_offset_ms` НЕ меняются: кнопка
+    /// пишет только `data/offsets.json`, а при игре эффективный оффсет = глобальный
+    /// + локальный (см. [`App::input_offsets`]). Устройство без тапов в этом прохождении
+    /// сохраняет прежнее значение.
+    fn apply_map_offsets(&mut self) {
+        match self.commit_map_offsets() {
+            Some(msg) => {
+                println!("{msg}");
+                self.toast = Some((msg, Instant::now()));
+            }
+            None => {
+                let msg = "Map offset: no tap data for this chart yet".to_string();
+                println!("{msg}");
+                self.toast = Some((msg, Instant::now()));
+            }
+        }
+    }
+
+    /// Записать рекомендации в карту и сохранить файл. `None` — сохранять
+    /// нечего (ни у одного устройства не было тапов).
+    fn commit_map_offsets(&mut self) -> Option<String> {
+        let (song, diff) = self.play_key.clone();
+        let mouse = self.result_map_mouse;
+        let tablet = self.result_map_tablet;
+        if mouse.is_none() && tablet.is_none() {
+            return None;
+        }
+        if let Some(ms) = mouse {
+            self.map_offsets
+                .set_local(&song, &diff, crate::map_offsets::MOUSE, ms);
+        }
+        if let Some(ms) = tablet {
+            self.map_offsets
+                .set_local(&song, &diff, crate::map_offsets::TABLET, ms);
+        }
+        self.map_offsets.save();
+        let m = self.map_offsets.local_ms(&song, &diff, crate::map_offsets::MOUSE);
+        let t = self.map_offsets.local_ms(&song, &diff, crate::map_offsets::TABLET);
+        Some(format!(
+            "Map offset saved: mouse {:+} · tablet {:+} ms",
+            m.round() as i32,
+            t.round() as i32
+        ))
     }
 }
 
@@ -2992,11 +3083,33 @@ pub fn shot_screen(
                 play.max_combo = 388;
                 play.counts = [412, 18, 6];
                 app.result_is_record = true;
-                app.result_recommended = 12.0;
-                app.result_mouse_rec = 7.0;
-                app.result_tablet_rec = -3.0;
-                app.mouse_offset_ms = 7.0;
-                app.tablet_offset_ms = 0.0;
+                // локальные оффсеты карты: рекомендации по этим тапам поверх
+                // значений из data/offsets.json (для демо-шота файл создаётся
+                // заранее). Глобальные настройки остаются из settings.json.
+                let song_id = app.songs[sel].id.clone();
+                let diff_name = c.diff.clone();
+                app.play_key = (song_id.clone(), diff_name.clone());
+                let mean = |v: &[f32]| -> Option<f32> {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.iter().sum::<f32>() / v.len() as f32)
+                    }
+                };
+                let m_mean = mean(&app.mouse_tap_errors);
+                let t_mean = mean(&app.tablet_tap_errors);
+                app.result_map_mouse = app.map_offsets.recommend(
+                    &song_id,
+                    &diff_name,
+                    crate::map_offsets::MOUSE,
+                    m_mean,
+                );
+                app.result_map_tablet = app.map_offsets.recommend(
+                    &song_id,
+                    &diff_name,
+                    crate::map_offsets::TABLET,
+                    t_mean,
+                );
                 app.mode = Mode::Result { song: sel, diff, play };
             }
             if screen == "replay" {

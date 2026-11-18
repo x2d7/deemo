@@ -7,6 +7,7 @@ mod bg;
 mod chart;
 mod clock;
 mod library;
+mod map_offsets;
 mod math;
 mod online;
 mod online_queue;

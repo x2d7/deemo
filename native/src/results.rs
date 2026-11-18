@@ -56,45 +56,6 @@ pub fn rank_for(accuracy: f32, full_combo: bool) -> &'static str {
 
 const PATH: &str = "data/results.json";
 
-/// Стабильная рекомендация оффсета по ошибке тайминга.
-///
-/// Формула `offset + mean_err` сходится только для «аудиального» игрока (бьёт по
-/// звуку): у него mean_err = L − offset, и рекомендация → L (латентность аудио).
-/// Для «визуального» игрока (бьёт, когда нота доходит до линии) mean_err не
-/// зависит от оффсета, и формула РАСХОДИТСЯ (−60 → −90 → −121 …), уводя музыку
-/// от нот. Детектируем визуального игрока по истории: если оффсет сменился, а
-/// ошибка осталась прежней — не дрейфуем. Плюс жёсткий clamp ±100 мс.
-pub fn recommended_offset(current: f32, mean_ms: f32) -> f32 {
-    let hist = ".work/offset_history.json";
-    // история: [offset, mean_err, visual_flag]
-    let prev: Option<(f32, f32, bool)> = std::fs::read_to_string(hist)
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<serde_json::Value>>(&t).ok())
-        .filter(|v| v.len() == 3)
-        .map(|v| {
-            (
-                v[0].as_f64().unwrap_or(0.0) as f32,
-                v[1].as_f64().unwrap_or(0.0) as f32,
-                v[2].as_bool().unwrap_or(false),
-            )
-        });
-    // визуальный игрок: оффсет сменился, а ошибка осталась прежней.
-    // флаг постоянный — будучи детектированным, не дрейфуем больше никогда.
-    let visual_now = match prev {
-        Some((po, pe, _)) => (current - po).abs() > 8.0 && (mean_ms - pe).abs() < 12.0,
-        None => false,
-    };
-    let visual = visual_now || prev.map(|p| p.2).unwrap_or(false);
-    let _ = std::fs::write(
-        hist,
-        serde_json::to_string(&serde_json::json!([current, mean_ms, visual])).unwrap_or_default(),
-    );
-    // визуальному игроку смена оффсета не помогает (ошибка от визуальной ноты),
-    // поэтому не двигаем оффсет — иначе музыка уходит от нот.
-    let rec = if visual { current } else { current + mean_ms };
-    rec.clamp(-100.0, 100.0)
-}
-
 /// Запись одного плея (для истории ранкинга).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PlayRecord {
