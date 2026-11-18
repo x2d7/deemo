@@ -101,6 +101,12 @@ pub fn pen_matches_cursor(pen_x_norm: f32, cursor_x: f32, width: f32, tol: f32) 
 /// `press_recently` / `pen_down` — факты из [`Tablets`], `report` — уже
 /// отфильтрованное по свежести состояние пера. Отдельная функция нужна, чтобы
 /// проверить все ветки без GPU/окна/планшета.
+/// Эмулирует ли перо это мышиное событие.
+///
+/// Эмулированное событие всегда приходит в координате пера, поэтому глушим
+/// только когда курсор в этой точке. Иначе страдает вторая рука: у пера и
+/// мыши два независимых курсора, и мышь должна работать, даже пока перо
+/// нажато.
 pub fn pen_emulates_mouse(
     press_recently: bool,
     pen_down: bool,
@@ -108,8 +114,8 @@ pub fn pen_emulates_mouse(
     cursor_x: f32,
     width: f32,
 ) -> bool {
-    if press_recently || pen_down {
-        return true;
+    if !(press_recently || pen_down) {
+        return false;
     }
     report.is_some_and(|st| {
         st.present && pen_matches_cursor(st.x_norm, cursor_x, width, PEN_X_TOLERANCE)
@@ -365,28 +371,43 @@ mod tests {
         assert!(!pen_emulates_mouse(false, false, None, 640.0, 1280.0));
     }
 
+    /// Мышь работает второй рукой: пока перо нажато, клик в другом месте —
+    /// это мышь, и глушить его нельзя.
     #[test]
-    fn recent_pen_press_is_filtered() {
-        assert!(pen_emulates_mouse(true, false, None, 640.0, 1280.0));
-        // курсор может быть где угодно: свежее нажатие важнее
-        assert!(pen_emulates_mouse(true, false, None, 10.0, 1280.0));
-    }
-
-    #[test]
-    fn pen_held_down_is_filtered() {
-        assert!(pen_emulates_mouse(false, true, None, 10.0, 1280.0));
-    }
-
-    #[test]
-    fn cursor_pen_proximity_matches_only_within_tolerance() {
+    fn mouse_away_from_the_pen_is_never_filtered() {
         let w = 1280.0;
-        // ровно в пере
-        assert!(pen_emulates_mouse(false, false, Some(pen(0.5)), 640.0, w));
-        // 0.5 % ширины от пера — ещё «та же точка»
-        assert!(pen_emulates_mouse(false, false, Some(pen(0.505)), 640.0, w));
-        // 5 % — уже настоящая мышь
-        assert!(!pen_emulates_mouse(false, false, Some(pen(0.55)), 640.0, w));
-        assert!(!pen_emulates_mouse(false, false, Some(pen(0.45)), 640.0, w));
+        // перо нажато в правой части, мышь кликает в левой
+        assert!(!pen_emulates_mouse(false, true, Some(pen(0.8)), 200.0, w));
+        assert!(!pen_emulates_mouse(true, true, Some(pen(0.8)), 200.0, w));
+        // и наоборот
+        assert!(!pen_emulates_mouse(false, true, Some(pen(0.2)), 1000.0, w));
+    }
+
+    /// Эмуляция пера всегда приходит в его координате — её и глушим.
+    #[test]
+    fn pen_emulation_at_the_pen_position_is_filtered() {
+        let w = 1280.0;
+        // нажатие пера и курсор ровно в нём
+        assert!(pen_emulates_mouse(true, true, Some(pen(0.5)), 640.0, w));
+        // 0.5 % ширины — ещё «та же точка»
+        assert!(pen_emulates_mouse(true, false, Some(pen(0.505)), 640.0, w));
+        // перо нажато и отчёт свежий, но курсор ушёл на 5 % — это мышь
+        assert!(!pen_emulates_mouse(true, true, Some(pen(0.55)), 640.0, w));
+        assert!(!pen_emulates_mouse(true, true, Some(pen(0.45)), 640.0, w));
+    }
+
+    #[test]
+    fn without_a_press_the_mouse_is_left_alone() {
+        let w = 1280.0;
+        // просто ховер над планшетом не должен глушить мышь
+        assert!(!pen_emulates_mouse(false, false, Some(pen(0.5)), 640.0, w));
+        // даже если курсор случайно в точке пера
+        assert!(!pen_emulates_mouse(false, false, Some(pen(0.5)), 641.0, w));
+    }
+
+    #[test]
+    fn press_without_a_report_cannot_be_attributed() {
+        assert!(!pen_emulates_mouse(true, true, None, 640.0, 1280.0));
     }
 
     #[test]

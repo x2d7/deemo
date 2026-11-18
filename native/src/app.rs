@@ -735,7 +735,7 @@ impl App {
     /// надо игнорировать, иначе в игре получается двойной удар (hidraw +
     /// эмулированный клик). udev-правило намеренно не ставим: оно сломало бы
     /// планшет для всей системы.
-    fn pen_emulated_mouse(&self) -> bool {
+    fn pen_emulated_mouse_at(&self, x: f32) -> bool {
         let Some(tablets) = self.tablets.as_ref() else {
             return false;
         };
@@ -744,7 +744,7 @@ impl App {
             tablets.pen_pressed_within(crate::tablet::PEN_PRESS_GRACE),
             tablets.pen_down(),
             tablets.pen_report_within(crate::tablet::PEN_REPORT_GRACE),
-            self.cursor[0],
+            x,
             w as f32,
         )
     }
@@ -1186,13 +1186,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // Пока перо нажато, оно тащит эмулированный системный курсор;
-                // настоящая мышь в этот момент «припаркована» и не должна
-                // сдвигать игровой курсор.
-                if self.tablets.as_ref().is_some_and(|t| t.pen_down()) {
-                    return;
+                // Перо двигает системный курсор в своей координате — такое
+                // движение игнорируем. Мышь в любой другой точке проходит:
+                // у пера и мыши два независимых курсора.
+                if !self.pen_emulated_mouse_at(position.x as f32) {
+                    self.cursor = [position.x as f32, position.y as f32];
                 }
-                self.cursor = [position.x as f32, position.y as f32];
                 if self.sbar_drag.is_some() && self.left_held {
                     self.sbar_drag_to(self.cursor[1]);
                 }
@@ -1230,7 +1229,7 @@ impl ApplicationHandler for App {
                 // Перо дублирует мышь через libinput/OTD. Свежий нажим пера,
                 // нажатое перо или курсор рядом с пером — значит клик пришёл
                 // от пера: не трогаем left_held, on_click и реплей.
-                if self.pen_emulated_mouse() {
+                if self.pen_emulated_mouse_at(self.cursor[0]) {
                     return;
                 }
                 self.left_held = state == ElementState::Pressed;
