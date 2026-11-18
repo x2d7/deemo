@@ -884,6 +884,36 @@ pub fn result_layout(w: f32, h: f32) -> ResultUi {
     }
 }
 
+/// pp из ответа сервера для экрана результата. Отправка асинхронная, поэтому
+/// строка живёт в трёх состояниях: нет данных / ждём очередь / готово.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ResultPp {
+    /// Показывать нечего (не вошли в аккаунт — отправлять некуда).
+    Hidden,
+    /// Рекорд в очереди, ответа сервера ещё нет.
+    Pending,
+    /// Сервер посчитал pp этой попытки.
+    Ready {
+        pp: f64,
+        total_pp: f64,
+        pp_tablet: f64,
+        pp_mouse: f64,
+        record: bool,
+    },
+}
+
+/// Одна маленькая строка под статистикой; `None` — строку не рисовать.
+/// `PP +172.6  ·  TOTAL 2760.6  ·  PEN 86.0 / MOUSE 86.6`
+pub fn pp_line(pp: ResultPp) -> Option<String> {
+    match pp {
+        ResultPp::Hidden => None,
+        ResultPp::Pending => Some("PP PENDING".to_string()),
+        ResultPp::Ready { pp, total_pp, pp_tablet, pp_mouse, .. } => Some(format!(
+            "PP {pp:+.1}  ·  TOTAL {total_pp:.1}  ·  PEN {pp_tablet:.1} / MOUSE {pp_mouse:.1}"
+        )),
+    }
+}
+
 pub struct ResultView<'a> {
     pub song_title: &'a str,
     pub artist: &'a str,
@@ -891,6 +921,8 @@ pub struct ResultView<'a> {
     pub play: &'a crate::play::Play,
     pub rank: &'a str,
     pub is_record: bool,
+    /// pp-ответ сервера по этой попытке (асинхронно из очереди отправки).
+    pub pp: ResultPp,
     /// Рекомендация локального оффсета карты по этому плею (мс);
     /// None — у устройства не было тапов (в UI «—»).
     pub map_mouse: Option<f32>,
@@ -952,6 +984,11 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
     let score_l = "SCORE";
     let slw = text.measure_tracked(Face::Serif, score_l, z(8.5), 3.0 * k);
     text.draw_tracked(Face::Serif, score_l, sr - slw, y(252.0), z(8.5), 3.0 * k, INK_FAINT, ui);
+    // настоящая точность попаданий (osu-стиль) — отдельно от achievement above:
+    // `98.74%`/счёт — игра как есть, эта строка — то, что видят сервер и сайт.
+    let hit = format!("ACCURACY {:.2}%", v.play.hit_accuracy());
+    let hitw = text.measure_tracked(Face::Serif, &hit, z(9.0), 2.2 * k);
+    text.draw_tracked(Face::Serif, &hit, sr - hitw, y(272.0), z(9.0), 2.2 * k, INK_DIM, ui);
     if v.is_record {
         let tag = "NEW RECORD";
         let tw = text.measure_tracked(Face::Serif, tag, z(9.0), 3.0 * k);
@@ -981,6 +1018,17 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
         if i > 0 {
             theme::hair_v(ui, white, x0, y(304.0), z(44.0), RULE, k);
         }
+    }
+
+    // pp из ответа сервера: одна маленькая строка прямо под статистикой.
+    // Отправка идёт в фоне, поэтому до ответа — «PP PENDING» (или ничего,
+    // если игрок не вошёл).
+    if let Some(line) = pp_line(v.pp) {
+        let col = match v.pp {
+            ResultPp::Ready { .. } => ACCENT_INK,
+            _ => INK_FAINT,
+        };
+        text.draw_centered_tracked(Face::Serif, &line, cx, y(354.0), z(9.5), 2.2 * k, col, ui);
     }
 
     // гистограммы таймингов

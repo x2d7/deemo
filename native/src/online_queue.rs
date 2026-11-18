@@ -9,6 +9,10 @@
 //! должно отправить старые рекорды на новый хост, поэтому такие записи остаются
 //! в очереди до возврата на свой сервер.
 //!
+//! Тело со временем только расширялось (`hands`, `achievement`), поэтому старые
+//! записи читаются и отправляются без миграции: у них есть `accuracy`, сервер
+//! остальные поля считает отсутствующими.
+//!
 //! Сеть — только в фоновом потоке: главный поток кладёт запись в файл,
 //! отправляет команду и забирает события через `mpsc` (как `auth_rx`).
 
@@ -158,38 +162,93 @@ pub fn due_for_server(entries: &[PendingScore], server: &str) -> Vec<PendingScor
         .collect()
 }
 
-/// Один POST. `true` только для 2xx: 3xx/4xx/5xx и транспортные ошибки
-/// оставляют запись в очереди.
-fn post_score(agent: &ureq::Agent, rec: &PendingScore) -> bool {
+/// Один POST. `Some(body)` только для 2xx: 3xx/4xx/5xx и транспортные ошибки
+/// оставляют запись в очереди (тело нужно, чтобы достать ответ с pp).
+fn post_score(agent: &ureq::Agent, rec: &PendingScore) -> Option<String> {
     let body = Value::Object(rec.body.clone());
-    match agent
+    let resp = agent
         .post(&rec.url())
         .set("Authorization", &format!("Bearer {}", rec.token))
         .send_json(body)
-    {
-        Ok(resp) => (200..300).contains(&resp.status()),
-        Err(_) => false,
+        .ok()?;
+    if (200..300).contains(&resp.status()) {
+        Some(resp.into_string().unwrap_or_default())
+    } else {
+        None
     }
 }
 
 /// До `retry.len() + 1` попыток с паузами между ними.
-fn post_with_retry(agent: &ureq::Agent, rec: &PendingScore, retry: &[Duration]) -> bool {
-    if post_score(agent, rec) {
-        return true;
+fn post_with_retry(agent: &ureq::Agent, rec: &PendingScore, retry: &[Duration]) -> Option<String> {
+    if let Some(body) = post_score(agent, rec) {
+        return Some(body);
     }
     for delay in retry {
         if !delay.is_zero() {
             std::thread::sleep(*delay);
         }
-        if post_score(agent, rec) {
-            return true;
+        if let Some(body) = post_score(agent, rec) {
+            return Some(body);
         }
     }
-    false
+    None
+}
+
+/// Ответ сервера на принятый рекорд. Аддитивные поля pp: старый сервер их не
+/// шлёт (тогда [`ScoreAck::parse`] вернёт `None`), новый считает сам.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScoreAck {
+    #[serde(default)]
+    pub record: bool,
+    #[serde(default)]
+    pub best: u64,
+    /// pp именно этой попытки и её сумма по аккаунту.
+    #[serde(default)]
+    pub pp: f64,
+    #[serde(default)]
+    pub total_pp: f64,
+    /// Разбивка по рукам (левая — перо/планшет, правая — мышь); в сумме = `pp`.
+    #[serde(default)]
+    pub pp_tablet: f64,
+    #[serde(default)]
+    pub pp_mouse: f64,
+}
+
+impl ScoreAck {
+    /// Разобрать тело 2xx. `None` — сервер не прислал `pp` (старая версия или
+    /// не-JSON ответ): загрузка успешна, показывать нечего.
+    pub fn parse(body: &str) -> Option<ScoreAck> {
+        let v: Value = serde_json::from_str(body).ok()?;
+        v.get("pp")?.as_f64()?;
+        Some(ScoreAck {
+            record: v["record"].as_bool().unwrap_or(false),
+            best: v["best"].as_u64().unwrap_or(0),
+            pp: v["pp"].as_f64().unwrap_or(0.0),
+            total_pp: v["total_pp"].as_f64().unwrap_or(0.0),
+            pp_tablet: v["pp_tablet"].as_f64().unwrap_or(0.0),
+            pp_mouse: v["pp_mouse"].as_f64().unwrap_or(0.0),
+        })
+    }
+}
+
+/// Загруженная запись + ответ сервера (для строки pp на экране результата).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UploadedScore {
+    pub rec: PendingScore,
+    pub ack: Option<ScoreAck>,
+}
+
+/// Итог одного прохода очереди.
+#[derive(Debug, Default)]
+pub struct FlushOutcome {
+    pub uploaded: usize,
+    pub failed: usize,
+    /// Ответы по успешно загруженным записям этого прохода.
+    pub acks: Vec<UploadedScore>,
 }
 
 /// Отправить все записи, записанные под `server`. Успешные удаляются из
-/// вектора и из файла; неуспешные остаются. Возвращает (отправлено, не вышло).
+/// вектора и из файла; неуспешные остаются.
 ///
 /// Чистая от сети точки зрения тестируемость: `retry` задаёт политику повторов
 /// (production — [`RETRY_DELAYS`], в тестах можно пустой/нулевой).
@@ -198,40 +257,41 @@ pub fn flush_pass(
     path: &Path,
     server: &str,
     retry: &[Duration],
-) -> (usize, usize) {
+) -> FlushOutcome {
     let due = {
         let guard = entries.lock().unwrap();
         due_for_server(&guard, server)
     };
+    let mut out = FlushOutcome::default();
     if due.is_empty() {
-        return (0, 0);
+        return out;
     }
     let agent = ureq::AgentBuilder::new().timeout(POST_TIMEOUT).build();
-    let mut uploaded = 0usize;
-    let mut failed = 0usize;
     for rec in due {
-        if post_with_retry(&agent, &rec, retry) {
+        if let Some(body) = post_with_retry(&agent, &rec, retry) {
+            let ack = ScoreAck::parse(&body);
             let mut guard = entries.lock().unwrap();
             if remove_one(&mut guard, &rec) {
                 if let Err(e) = save_entries(path, &guard) {
                     eprintln!("online queue: cannot rewrite {}: {e}", path.display());
                 }
             }
-            uploaded += 1;
+            out.uploaded += 1;
+            out.acks.push(UploadedScore { rec, ack });
         } else {
             eprintln!(
                 "online queue: {} / {} stays queued (upload failed)",
                 rec.song(),
                 rec.body.get("diff").and_then(|v| v.as_str()).unwrap_or("")
             );
-            failed += 1;
+            out.failed += 1;
         }
     }
-    (uploaded, failed)
+    out
 }
 
 /// Итог одного прохода очереди для UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueueEvent {
     /// Номер команды (см. [`OnlineQueue::enqueue`] / [`OnlineQueue::flush`]).
     pub seq: u64,
@@ -239,6 +299,8 @@ pub struct QueueEvent {
     pub failed: usize,
     /// `true` — проход сразу после нового результата, `false` — фоновый.
     pub immediate: bool,
+    /// Ответы сервера (включая pp) по загруженным записям.
+    pub acks: Vec<UploadedScore>,
 }
 
 struct FlushCmd {
@@ -270,13 +332,13 @@ impl OnlineQueue {
         let worker_path = path.clone();
         std::thread::spawn(move || {
             while let Ok(cmd) = cmd_rx.recv() {
-                let (uploaded, failed) =
-                    flush_pass(&state, &worker_path, &cmd.server, &RETRY_DELAYS);
+                let out = flush_pass(&state, &worker_path, &cmd.server, &RETRY_DELAYS);
                 let _ = evt_tx.send(QueueEvent {
                     seq: cmd.seq,
-                    uploaded,
-                    failed,
+                    uploaded: out.uploaded,
+                    failed: out.failed,
                     immediate: cmd.immediate,
+                    acks: out.acks,
                 });
             }
         });
@@ -375,6 +437,14 @@ mod tests {
     /// Мини-сервер: на каждый запрос отвечает очередным кодом и запоминает
     /// полученный запрос целиком.
     fn stub(codes: &[u16]) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        stub_ok_body(codes, r#"{"record":true,"best":999999}"#)
+    }
+
+    /// Тот же мини-сервер, но с заданным телом 2xx (чтобы проверить pp-ответ).
+    fn stub_ok_body(
+        codes: &[u16],
+        ok_body: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let codes: Vec<u16> = codes.to_vec();
@@ -400,8 +470,8 @@ mod tests {
                     }
                 }
                 seen.push(String::from_utf8_lossy(&buf).to_string());
-                let body = if (200..300).contains(&code) {
-                    r#"{"record":true,"best":999999}"#
+                let body: &str = if (200..300).contains(&code) {
+                    ok_body
                 } else {
                     r#"{"error":"stub"}"#
                 };
@@ -428,6 +498,12 @@ mod tests {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
         buf.len() >= end + 4 + len
+    }
+
+    /// Тело запроса, которое увидел мини-сервер (для проверки JSON).
+    fn request_body(req: &str) -> serde_json::Value {
+        let (_, body) = req.split_once("\r\n\r\n").expect("headers/body");
+        serde_json::from_str(body).expect("request body must be JSON")
     }
 
     #[test]
@@ -515,8 +591,8 @@ mod tests {
         let (server, handle) = stub(&[200]);
         let entry = rec(&server, "tok-42", "ad3quimi", 999_192);
         let entries = Mutex::new(vec![entry.clone()]);
-        let (uploaded, failed) = flush_pass(&entries, &path, &server, &[]);
-        assert_eq!((uploaded, failed), (1, 0), "2xx must count as uploaded");
+        let out = flush_pass(&entries, &path, &server, &[]);
+        assert_eq!((out.uploaded, out.failed), (1, 0), "2xx must count as uploaded");
         assert!(entries.lock().unwrap().is_empty(), "entry removed in memory");
         save_entries(&path, &entries.lock().unwrap()).unwrap();
         assert!(load_entries(&path).is_empty(), "entry removed on disk");
@@ -538,8 +614,8 @@ mod tests {
         let path = temp_path("retry");
         let (server, handle) = stub(&[500, 502, 200]);
         let entries = Mutex::new(vec![rec(&server, "tk", "retry-song", 7)]);
-        let (uploaded, failed) = flush_pass(&entries, &path, &server, &[Duration::ZERO, Duration::ZERO]);
-        assert_eq!((uploaded, failed), (1, 0));
+        let out = flush_pass(&entries, &path, &server, &[Duration::ZERO, Duration::ZERO]);
+        assert_eq!((out.uploaded, out.failed), (1, 0));
         assert!(entries.lock().unwrap().is_empty());
         assert_eq!(handle.join().unwrap().len(), 3, "three attempts");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -551,8 +627,8 @@ mod tests {
         let dead = "http://127.0.0.1:1";
         let entries = Mutex::new(vec![rec(dead, "tk", "stays", 5)]);
         save_entries(&path, &entries.lock().unwrap()).unwrap();
-        let (uploaded, failed) = flush_pass(&entries, &path, dead, &[]);
-        assert_eq!((uploaded, failed), (0, 1));
+        let out = flush_pass(&entries, &path, dead, &[]);
+        assert_eq!((out.uploaded, out.failed), (0, 1));
         assert_eq!(entries.lock().unwrap().len(), 1, "entry stays in memory");
         let loaded = load_entries(&path);
         assert_eq!(loaded.len(), 1, "entry stays on disk");
@@ -568,8 +644,8 @@ mod tests {
         let other = rec("http://127.0.0.1:1", "tk", "other", 2);
         let entries = Mutex::new(vec![other.clone(), mine.clone()]);
         save_entries(&path, &entries.lock().unwrap()).unwrap();
-        let (uploaded, failed) = flush_pass(&entries, &path, &server, &[]);
-        assert_eq!((uploaded, failed), (1, 0));
+        let out = flush_pass(&entries, &path, &server, &[]);
+        assert_eq!((out.uploaded, out.failed), (1, 0));
         let left = entries.lock().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0], other, "entry for another server must be kept");
@@ -585,9 +661,136 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build();
             let entry = rec(&server, "tk", "status", 1);
-            assert_eq!(post_score(&agent, &entry), want, "status {code}");
+            assert_eq!(post_score(&agent, &entry).is_some(), want, "status {code}");
             let _ = handle.join();
         }
+    }
+
+    /// Ответ нового сервера: pp этой попытки, сумма по аккаунту и разбивка по рукам.
+    #[test]
+    fn ack_carries_pp_from_the_server() {
+        let body = r#"{"record":true,"best":987430,"pp":172.6,"total_pp":2760.6,"pp_tablet":86.0,"pp_mouse":86.6}"#;
+        let ack = ScoreAck::parse(body).expect("pp ack");
+        assert!(ack.record);
+        assert_eq!(ack.best, 987_430);
+        assert!((ack.pp - 172.6).abs() < 1e-9);
+        assert!((ack.total_pp - 2760.6).abs() < 1e-9);
+        assert!((ack.pp_tablet + ack.pp_mouse - ack.pp).abs() < 1e-9);
+        // старый сервер (без pp) и не-JSON: загрузка успешна, показывать нечего
+        assert!(ScoreAck::parse(r#"{"record":true,"best":9}"#).is_none());
+        assert!(ScoreAck::parse("<html>ok</html>").is_none());
+        assert!(ScoreAck::parse(r#"{"pp":null}"#).is_none());
+    }
+
+    fn body_with_hands(server: &str, song: &str) -> PendingScore {
+        let body = serde_json::json!({
+            "song": song, "diff": "hard", "score": 987_430,
+            "accuracy": 96.56, "achievement": 98.74, "max_combo": 388,
+            "perfect": 412, "good": 18, "miss": 6,
+            "rank": "S", "full_combo": false, "speed": 4.0,
+            "timestamp": 1_794_940_377u64,
+            "hands": {
+                "mouse": {"perfect": 210, "good": 9, "miss": 4},
+                "tablet": {"perfect": 202, "good": 9, "miss": 2},
+            },
+        });
+        PendingScore::new(server, "tk", body.as_object().unwrap().clone())
+    }
+
+    /// Файл очереди, записанный до появления `hands` (старая версия игры),
+    /// обязан читаться и отправляться как раньше — без поля `hands`.
+    #[test]
+    fn old_queue_entry_without_hands_still_loads_and_submits() {
+        let path = temp_path("old-entry");
+        let (server, handle) = stub(&[200]);
+        let old = format!(
+            r#"{{
+  "pending": [
+    {{
+      "server": "{server}",
+      "token": "old-token",
+      "song": "ad3quimi", "diff": "hard", "score": 900000,
+      "accuracy": 97.5, "max_combo": 300,
+      "perfect": 300, "good": 12, "miss": 3,
+      "rank": "S", "full_combo": false, "speed": 4.0,
+      "timestamp": 1794940377
+    }}
+  ]
+}}"#
+        );
+        std::fs::write(&path, old).unwrap();
+        let loaded = load_entries(&path);
+        assert_eq!(loaded.len(), 1, "old entry must load");
+        assert!(loaded[0].body.get("hands").is_none(), "no hands in an old entry");
+        // старая запись несёт только accuracy (тогда это был achievement) —
+        // отправляется как есть, без achievement и без миграции
+        assert!(loaded[0].body.get("achievement").is_none());
+        assert_eq!(loaded[0].body["accuracy"], 97.5);
+        let entries = Mutex::new(loaded);
+        let out = flush_pass(&entries, &path, &server, &[]);
+        assert_eq!((out.uploaded, out.failed), (1, 0));
+        assert!(entries.lock().unwrap().is_empty());
+        assert!(out.acks[0].ack.is_none(), "old stub server sends no pp");
+
+        let reqs = handle.join().unwrap();
+        let req = &reqs[0];
+        assert!(req.contains("\"song\":\"ad3quimi\""), "body: {req}");
+        assert!(!req.contains("\"hands\""), "old entry must not grow a hands field: {req}");
+        // старые записи не получают и achievement — тело уходит как записано
+        assert!(!req.contains("\"achievement\""), "old entry must not grow achievement: {req}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Новый рекорд с `hands`: поле переживает запись/чтение файла и уходит на
+    /// сервер под теми же именами, что он ждёт.
+    #[test]
+    fn hands_survive_the_queue_file_and_reach_the_server() {
+        let path = temp_path("hands");
+        let (server, handle) = stub(&[200]);
+        let entry = body_with_hands(&server, "12thchance");
+        let mut entries = Vec::new();
+        push_capped(&mut entries, entry.clone(), MAX_ENTRIES);
+        save_entries(&path, &entries).unwrap();
+        let loaded = load_entries(&path);
+        assert_eq!(loaded, vec![entry.clone()], "hands must round-trip");
+        assert_eq!(loaded[0].body["hands"]["mouse"]["perfect"], 210);
+        assert_eq!(loaded[0].body["hands"]["tablet"]["miss"], 2);
+
+        let out = flush_pass(&Mutex::new(loaded), &path, &server, &[]);
+        assert_eq!((out.uploaded, out.failed), (1, 0));
+        let reqs = handle.join().unwrap();
+        let req = &reqs[0];
+        let body = request_body(req);
+        assert_eq!(body["hands"]["mouse"]["perfect"], 210, "body: {body}");
+        assert_eq!(body["hands"]["mouse"]["good"], 9, "body: {body}");
+        assert_eq!(body["hands"]["mouse"]["miss"], 4, "body: {body}");
+        assert_eq!(body["hands"]["tablet"]["perfect"], 202, "body: {body}");
+        assert_eq!(body["hands"]["tablet"]["good"], 9, "body: {body}");
+        assert_eq!(body["hands"]["tablet"]["miss"], 2, "body: {body}");
+        // ровно два ключа в hands — сервер других не знает
+        assert_eq!(body["hands"].as_object().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Событие фонового потока должно донести pp-ответ до UI.
+    #[test]
+    fn live_queue_event_carries_the_pp_ack() {
+        let path = temp_path("live-pp");
+        let pp_body = r#"{"record":true,"best":987430,"pp":172.6,"total_pp":2760.6,"pp_tablet":86.0,"pp_mouse":86.6}"#;
+        let (server, handle) = stub_ok_body(&[200], pp_body);
+        let mut q = OnlineQueue::open(&path);
+        let entry = body_with_hands(&server, "12thchance");
+        let seq = q.enqueue(entry.clone(), &server);
+        let ev = wait_event(&q, Duration::from_secs(5)).expect("queue event");
+        assert_eq!(ev.seq, seq);
+        assert_eq!((ev.uploaded, ev.failed), (1, 0));
+        assert_eq!(ev.acks.len(), 1);
+        assert_eq!(ev.acks[0].rec, entry);
+        let ack = ev.acks[0].ack.as_ref().expect("ack");
+        assert!((ack.pp - 172.6).abs() < 1e-9);
+        assert!((ack.total_pp - 2760.6).abs() < 1e-9);
+        let _ = handle.join();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Дождаться события фонового потока очереди (как это делает игровой цикл).
@@ -637,6 +840,99 @@ mod tests {
         assert_eq!((ev.uploaded, ev.failed), (0, 1));
         assert!(q.contains(&entry), "failed record stays queued");
         assert_eq!(load_entries(&path), vec![entry], "failed record stays on disk");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Живой прогон НАСТОЯЩЕГО клиентского пути (`Online::pending_score` →
+    /// `score_body` → файл очереди → POST → pp-ответ) против `DEEMO_LIVE_SERVER`.
+    ///
+    /// Нужны `DEEMO_LIVE_NICK` / `DEEMO_LIVE_PW` (одноразовый аккаунт: тест сам
+    /// регистрируется) и `DEEMO_LIVE_SONG` (по умолчанию `12thchance`) —
+    /// сервер должен знать эту песню в своём каталоге паков, иначе pp = 0.
+    /// `data/auth.json` не трогается: токен живёт только в памяти.
+    ///
+    /// Запуск: `cargo test --release live_server_hands -- --ignored --nocapture`
+    #[test]
+    #[ignore = "network: registers a throwaway account and submits one real record"]
+    fn live_server_hands_round_trip_returns_pp() {
+        use crate::online::{AuthState, Online};
+        use crate::play::{HandCounts, Hands, Play};
+
+        let server = std::env::var("DEEMO_LIVE_SERVER")
+            .unwrap_or_else(|_| crate::online::DEFAULT_SERVER.to_string());
+        let nick = std::env::var("DEEMO_LIVE_NICK").expect("DEEMO_LIVE_NICK");
+        let pw = std::env::var("DEEMO_LIVE_PW").expect("DEEMO_LIVE_PW");
+        let song = std::env::var("DEEMO_LIVE_SONG").unwrap_or_else(|_| "12thchance".into());
+        let url = |p: &str| format!("{}{p}", normalize_server(&server));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .build();
+        let auth_body = serde_json::json!({"nickname": nick, "password": pw});
+        let resp = match agent.post(&url("/api/register")).send_json(auth_body.clone()) {
+            Ok(r) => r,
+            Err(ureq::Error::Status(409, _)) => agent
+                .post(&url("/api/login"))
+                .send_json(auth_body)
+                .expect("login"),
+            Err(e) => panic!("register: {e}"),
+        };
+        let v: serde_json::Value = resp.into_json().expect("auth json");
+        let token = v["token"].as_str().expect("token").to_string();
+
+        // Настоящая карта: counts берём по её нотам, руку — по знаку pos.
+        let chart = crate::chart::Chart::load("../data/charts/12thchance/hard.json")
+            .or_else(|_| crate::chart::Chart::load("data/charts/12thchance/hard.json"))
+            .expect("chart for the live song");
+        let mut hands = Hands::default();
+        let mut play = Play::new(&chart);
+        for n in &chart.notes {
+            hands.get_mut(crate::play::hand_of_pos(n.pos)).add(crate::play::Judge::Perfect);
+        }
+        let notes = chart.notes.len() as u32;
+        assert_eq!(hands.total(), notes);
+        // идеальный плей: все Perfect, achievement 100%
+        play.counts = [notes, 0, 0];
+        play.score = 1_000_000;
+        play.max_combo = notes;
+        assert_eq!(play.hit_accuracy(), 100.0);
+        assert_eq!(play.accuracy(), 100.0);
+
+        let online = Online {
+            state: AuthState {
+                server: server.clone(),
+                token: Some(token.clone()),
+                nickname: Some(nick.clone()),
+            },
+        };
+        let rec = online
+            .pending_score(&song, "hard", &play, 7.7, &hands)
+            .expect("pending score");
+        let sent = serde_json::Value::Object(rec.body.clone());
+        println!("POST {}\n{sent}", rec.url());
+
+        let path = temp_path("live-hands");
+        let mut q = OnlineQueue::open(&path);
+        let seq = q.enqueue(rec.clone(), &server);
+        let ev = wait_event(&q, Duration::from_secs(60)).expect("queue event");
+        assert_eq!(ev.seq, seq);
+        assert_eq!((ev.uploaded, ev.failed), (1, 0), "live upload must succeed");
+        let uploaded = ev.acks.first().expect("uploaded entry");
+        assert_eq!(uploaded.rec, rec);
+        let ack = uploaded.ack.as_ref().expect("server must return pp");
+        println!("ack: {ack:?}");
+        assert!(ack.pp > 0.0, "server must compute pp from the submitted hands");
+        assert!(ack.total_pp >= ack.pp);
+        assert!(
+            (ack.pp_tablet + ack.pp_mouse - ack.pp).abs() < 0.05,
+            "per-hand pp must sum to pp"
+        );
+        assert!((ack.pp_mouse - ack.pp_tablet).abs() > 0.0, "hands differ");
+        assert!(ack.record, "first score of a fresh account is a record");
+        // руки действительно дошли до сервера в формате {mouse, tablet}
+        assert_eq!(sent["hands"]["mouse"]["perfect"], hands.mouse.perfect);
+        assert_eq!(sent["hands"]["tablet"]["perfect"], hands.tablet.perfect);
+        assert_eq!(sent["accuracy"], 100.0);
+        assert_eq!(sent["achievement"], 100.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

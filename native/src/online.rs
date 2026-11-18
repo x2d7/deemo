@@ -118,23 +118,36 @@ impl Online {
         self.save();
     }
 
-    /// Тело POST /api/scores — ровно те же поля, что отправлялись и раньше.
+    /// Тело POST /api/scores — прежние поля плюс аддитивная статистика по
+    /// рукам `hands` (`{"mouse": {...}, "tablet": {...}}`), по которой сервер
+    /// считает pp. Старые серверы лишнее поле игнорируют.
+    ///
+    /// `accuracy` — НАСТОЯЩАЯ точность попаданий (проценты, 2 знака, osu-стиль,
+    /// её показывает сайт), `achievement` — прежнее значение `Play::accuracy()`
+    /// (achievement rate из счёта с комбо-бонусом). `score` остаётся в теле:
+    /// сервер его хранит, хотя сайт для рейтинга берёт accuracy/pp.
     pub fn score_body(
         song: &str,
         diff: &str,
         play: &crate::play::Play,
         speed: f32,
+        hands: &crate::play::Hands,
     ) -> serde_json::Map<String, serde_json::Value> {
-        let acc = play.accuracy();
+        let hit_acc = round2(play.hit_accuracy() as f64);
+        let achievement = play.accuracy();
         let body = serde_json::json!({
             "song": song, "diff": diff,
-            "score": play.score, "accuracy": acc,
+            "score": play.score,
+            "accuracy": hit_acc,
+            "achievement": achievement,
             "max_combo": play.max_combo,
             "perfect": play.counts[0], "good": play.counts[1], "miss": play.counts[2],
-            "rank": crate::results::rank_for(acc, play.counts[2] == 0),
+            // ранг по-прежнему из achievement — как в самой игре
+            "rank": crate::results::rank_for(achievement, play.counts[2] == 0),
             "full_combo": play.counts[2] == 0,
             "speed": speed,
             "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            "hands": hands,
         });
         body.as_object().cloned().unwrap_or_default()
     }
@@ -147,9 +160,10 @@ impl Online {
         diff: &str,
         play: &crate::play::Play,
         speed: f32,
+        hands: &crate::play::Hands,
     ) -> Option<crate::online_queue::PendingScore> {
         let token = self.state.token.clone()?;
-        let body = Self::score_body(song, diff, play, speed);
+        let body = Self::score_body(song, diff, play, speed, hands);
         Some(crate::online_queue::PendingScore::new(
             &self.state.server,
             &token,
@@ -165,6 +179,11 @@ impl Online {
         let recs: Vec<OnlineRecord> = serde_json::from_value(v["leaderboard"].clone()).map_err(|e| e.to_string())?;
         Ok(recs)
     }
+}
+
+/// Округление до 2 знаков — так сервер и сайт показывают проценты.
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 fn fmt_err(e: ureq::Error) -> String {
@@ -207,5 +226,73 @@ mod tests {
             normalize_server(&mut st);
             assert_eq!(st.server, keep);
         }
+    }
+
+    /// Тело записи: прежние поля на месте, `hands` — в формате сервера.
+    #[test]
+    fn score_body_carries_per_hand_counts() {
+        use crate::chart::{Chart, Note, NoteKind};
+        use crate::play::{HandCounts, Hands, Play};
+        let chart = Chart {
+            speed: 6.0,
+            notes: vec![Note {
+                time: 1.0,
+                pos: 0.5,
+                size: 1.0,
+                speed: 1.0,
+                kind: NoteKind::Normal,
+                hold: 0.0,
+                sounds: vec![],
+            }],
+            links: vec![],
+        };
+        let mut play = Play::new(&chart);
+        play.score = 987_430;
+        play.max_combo = 388;
+        play.counts = [412, 18, 6];
+        let hands = Hands {
+            mouse: HandCounts { perfect: 210, good: 9, miss: 4 },
+            tablet: HandCounts { perfect: 202, good: 9, miss: 2 },
+        };
+        let body = Online::score_body("12thchance", "hard", &play, 4.0, &hands);
+        let v = serde_json::Value::Object(body);
+        // старые поля не изменились
+        assert_eq!(v["song"], "12thchance");
+        assert_eq!(v["diff"], "hard");
+        assert_eq!(v["score"], 987_430);
+        assert_eq!(v["perfect"], 412);
+        assert_eq!(v["good"], 18);
+        assert_eq!(v["miss"], 6);
+        assert_eq!(v["max_combo"], 388);
+        assert_eq!(v["full_combo"], false);
+        assert_eq!(v["speed"], 4.0);
+        // `accuracy` — настоящая точность попаданий: (412 + 0.5·18) / 436
+        let hit = (412.0 + 0.5 * 18.0) / 436.0 * 100.0;
+        assert!(
+            (v["accuracy"].as_f64().unwrap() - hit).abs() < 0.005,
+            "accuracy must be the hit accuracy: {} vs {hit}",
+            v["accuracy"]
+        );
+        // `achievement` — прежнее значение из счёта (с комбо-бонусом)
+        assert!(
+            (v["achievement"].as_f64().unwrap() - 98.74).abs() < 1e-4,
+            "achievement must be the score-derived rate: {}",
+            v["achievement"]
+        );
+        // точность попаданий строго ниже achievement при таких счётах
+        assert!(v["accuracy"].as_f64().unwrap() < v["achievement"].as_f64().unwrap());
+        // аддитивная статистика по рукам
+        let h = &v["hands"];
+        assert_eq!(h["mouse"]["perfect"], 210);
+        assert_eq!(h["mouse"]["good"], 9);
+        assert_eq!(h["mouse"]["miss"], 4);
+        assert_eq!(h["tablet"]["perfect"], 202);
+        assert_eq!(h["tablet"]["good"], 9);
+        assert_eq!(h["tablet"]["miss"], 2);
+        assert_eq!(
+            h["mouse"].as_object().unwrap().len(),
+            3,
+            "only perfect/good/miss"
+        );
     }
 }

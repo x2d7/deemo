@@ -17,7 +17,7 @@ use crate::library::{self, Song};
 use crate::play::{Judge, Play};
 use crate::render::{Renderer, ScreenQuad, UiQuad};
 use crate::scene::Scene;
-use crate::screens;
+use crate::screens::{self, ResultPp};
 use crate::settings::Settings;
 use crate::settings_screen::{Action as SettingsAction, PacksPhase, PacksUi, SettingsScreen};
 use crate::stage::{active_ahead_time, Tex};
@@ -146,6 +146,37 @@ pub fn queue_toast(immediate: bool, uploaded: usize, still_queued: bool) -> Opti
     }
 }
 
+/// Тост об успешной загрузке: с pp, если сервер его прислал
+/// (`Score uploaded · +172.6 pp`), иначе прежний текст.
+pub fn upload_toast(ack: Option<&crate::online_queue::ScoreAck>) -> String {
+    match ack {
+        Some(a) => format!("Score uploaded · +{:.1} pp", a.pp),
+        None => "Score uploaded".to_string(),
+    }
+}
+
+/// Ответ сервера по рекорду → состояние строки pp на экране результата.
+pub fn result_pp_from_ack(ack: &crate::online_queue::ScoreAck) -> ResultPp {
+    ResultPp::Ready {
+        pp: ack.pp,
+        total_pp: ack.total_pp,
+        pp_tablet: ack.pp_tablet,
+        pp_mouse: ack.pp_mouse,
+        record: ack.record,
+    }
+}
+
+/// Найти в ответах прохода очередь ответ именно для показанного результата:
+/// в одном проходе могут уйти и старые записи из очереди.
+pub fn ack_for_result<'a>(
+    want: &crate::online_queue::PendingScore,
+    acks: &'a [crate::online_queue::UploadedScore],
+) -> Option<&'a crate::online_queue::ScoreAck> {
+    acks.iter()
+        .find(|u| &u.rec == want)
+        .and_then(|u| u.ack.as_ref())
+}
+
 /// Геометрия меню выбора песен.
 
 pub struct App {
@@ -227,6 +258,14 @@ pub struct App {
     /// ошибки тапов по устройствам (без слайдеров) для раздельной калибровки
     mouse_tap_errors: Vec<f32>,
     tablet_tap_errors: Vec<f32>,
+    /// судейства по рукам за текущий плей: мышь (правая) и перо/планшет (левая).
+    /// Авто-Miss добавляются из [`Play::auto_miss`] при показе результата.
+    hands: crate::play::Hands,
+    /// pp-ответ сервера по результату, который сейчас на экране.
+    result_pp: ResultPp,
+    /// Запись, отправленная за этот результат: по ней строка pp находит свой
+    /// ответ в событиях очереди (а не чужой рекорд из того же прохода).
+    result_rec: Option<crate::online_queue::PendingScore>,
     /// локальные оффсеты ввода на карту (song:diff), раздельно мышь/планшет
     map_offsets: crate::map_offsets::MapOffsets,
     /// ключ текущей карты (id песни, имя сложности) для map_offsets
@@ -384,6 +423,9 @@ impl App {
             result_is_record: false,
             mouse_tap_errors: Vec::new(),
             tablet_tap_errors: Vec::new(),
+            hands: crate::play::Hands::default(),
+            result_pp: ResultPp::Hidden,
+            result_rec: None,
             map_offsets: crate::map_offsets::MapOffsets::load(),
             play_key: (String::new(), String::new()),
             result_map_mouse: None,
@@ -621,6 +663,9 @@ impl App {
         self.music_ended_at = None;
         self.mouse_tap_errors.clear();
         self.tablet_tap_errors.clear();
+        self.hands = crate::play::Hands::default();
+        self.result_pp = ResultPp::Hidden;
+        self.result_rec = None;
         // у каждого планшета свой press-edge; иначе зажатый стилус с прошлой
         // песни давал бы фантомный тап в начале новой
         self.gaomon_was_pressed = false;
@@ -1947,6 +1992,16 @@ impl App {
     /// Принять события очереди отправки рекордов (вызывается каждый кадр).
     fn poll_online_queue(&mut self) {
         while let Some(ev) = self.queue.poll() {
+            // pp по результату, который сейчас на экране. Ответ мог прийти как
+            // сразу после игры, так и фоновым проходом (рекорд был в очереди).
+            let ack = self
+                .result_rec
+                .as_ref()
+                .and_then(|want| ack_for_result(want, &ev.acks))
+                .cloned();
+            if let Some(ack) = &ack {
+                self.result_pp = result_pp_from_ack(ack);
+            }
             if ev.immediate {
                 // событие на команду, отправленную сразу после результата
                 let Some(pos) = self
@@ -1958,10 +2013,16 @@ impl App {
                 };
                 let (_, rec) = self.score_reports.remove(pos);
                 // Запись уже вычеркнута из очереди → 2xx; иначе она осталась.
-                let msg = queue_toast(true, ev.uploaded, self.queue.contains(&rec));
-                if let Some(msg) = msg {
+                if ack.is_some() {
+                    self.toast = Some((upload_toast(ack.as_ref()), Instant::now()));
+                } else if let Some(msg) =
+                    queue_toast(true, ev.uploaded, self.queue.contains(&rec))
+                {
                     self.toast = Some((msg.to_string(), Instant::now()));
                 }
+            } else if ack.is_some() {
+                // догрузка записи, которая ждала в очереди офлайн
+                self.toast = Some((upload_toast(ack.as_ref()), Instant::now()));
             } else if let Some(msg) = queue_toast(false, ev.uploaded, false) {
                 // фоновая отправка (старт игры или периодический ретрай)
                 self.toast = Some((msg.to_string(), Instant::now()));
@@ -2161,6 +2222,10 @@ impl App {
             }
             if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
                 self.mouse_tap_errors.push(err_ms);
+            }
+            // статистика по рукам: каждый тап засчитывается своему устройству
+            if let Some(j) = judge {
+                self.hands.mouse.add(j);
             }
             if let Some(r) = &mut self.replay {
                 r.action(tj, 0, true, x, judge, err_ms);
@@ -2373,6 +2438,10 @@ impl App {
                         if hit {
                             self.tablet_tap_errors.push(err);
                         }
+                        // статистика по рукам: тап стилуса = левая рука
+                        if let Some(j) = j {
+                            self.hands.tablet.add(j);
+                        }
                         if let Some(r) = &mut self.replay {
                             r.action(tj, 1, true, px, j, err);
                         }
@@ -2441,17 +2510,26 @@ impl App {
             );
             // сохраняем лучший результат локально
             self.result_is_record = self.results.record(&song_id, &diff_name, &play, self.speed);
+            // статистика по рукам: к тапам добавляем авто-Miss, которые
+            // play.update атрибутировал руке по знаку pos
+            let mut hands = self.hands;
+            hands.fold_auto_miss(&play);
             // онлайн: рекорд сначала в очередь на диск, отправка — в фоне
+            self.result_pp = ResultPp::Hidden;
+            self.result_rec = None;
             if let Some(rec) =
                 self.online
-                    .pending_score(&song_id, &diff_name, &play, self.speed)
+                    .pending_score(&song_id, &diff_name, &play, self.speed, &hands)
             {
                 let server = rec.server.clone();
                 let seq = self.queue.enqueue(rec.clone(), &server);
-                self.score_reports.push((seq, rec));
+                self.score_reports.push((seq, rec.clone()));
                 if self.score_reports.len() > 8 {
                     self.score_reports.remove(0);
                 }
+                // ответа ещё нет: показываем «PP PENDING» до события очереди
+                self.result_pp = ResultPp::Pending;
+                self.result_rec = Some(rec);
             }
             // дамп таймингов для диагностики оффсета
             if let Ok(mut f) = std::fs::File::create(".work/offset_debug.json") {
@@ -2900,6 +2978,7 @@ impl App {
             play,
             rank,
             is_record: self.result_is_record,
+            pp: self.result_pp,
             map_mouse: self.result_map_mouse,
             map_tablet: self.result_map_tablet,
             local_mouse: self.map_offsets.local_ms(
@@ -3083,6 +3162,20 @@ pub fn shot_screen(
                 play.max_combo = 388;
                 play.counts = [412, 18, 6];
                 app.result_is_record = true;
+                // Строка pp: без сети подставляем ответ сервера (как будто
+                // запись уже ушла и пришёл ack) — для проверки вёрстки.
+                // `DEEMO_SHOT_PP=pending` рисует состояние «ждём очередь».
+                app.result_pp = if std::env::var("DEEMO_SHOT_PP").as_deref() == Ok("pending") {
+                    screens::ResultPp::Pending
+                } else {
+                    screens::ResultPp::Ready {
+                        pp: 172.6,
+                        total_pp: 2760.6,
+                        pp_tablet: 86.0,
+                        pp_mouse: 86.6,
+                        record: true,
+                    }
+                };
                 // локальные оффсеты карты: рекомендации по этим тапам поверх
                 // значений из data/offsets.json (для демо-шота файл создаётся
                 // заранее). Глобальные настройки остаются из settings.json.
@@ -3520,6 +3613,59 @@ mod tests {
             assert!(!msg.contains('!'), "Deemo tone: no exclamation marks");
             assert!(!msg.contains('\n'), "one short line");
         }
+    }
+
+    /// Ответ сервера по загруженной записи обновляет строку pp на результате,
+    /// а чужая запись из того же прохода очереди — нет.
+    #[test]
+    fn pp_ack_updates_the_result_line_of_that_play() {
+        use crate::online_queue::{PendingScore, ScoreAck, UploadedScore};
+        let body = serde_json::json!({
+            "song": "12thchance", "diff": "hard", "score": 987_430,
+            "accuracy": 96.56, "achievement": 98.74, "timestamp": 7,
+        });
+        let mine = PendingScore::new("http://srv", "tk", body.as_object().unwrap().clone());
+        let other = {
+            let b = serde_json::json!({
+                "song": "old", "diff": "hard", "score": 1,
+                "accuracy": 1.0, "timestamp": 1,
+            });
+            PendingScore::new("http://srv", "tk", b.as_object().unwrap().clone())
+        };
+        let ack = ScoreAck {
+            record: true,
+            best: 987_430,
+            pp: 172.6,
+            total_pp: 2760.6,
+            pp_tablet: 86.0,
+            pp_mouse: 86.6,
+        };
+        let acks = vec![
+            UploadedScore { rec: other.clone(), ack: Some(ScoreAck { pp: 4.0, ..ack.clone() }) },
+            UploadedScore { rec: mine.clone(), ack: Some(ack.clone()) },
+        ];
+        let pp = super::result_pp_from_ack(super::ack_for_result(&mine, &acks).expect("ack for my play"));
+        assert!(super::ack_for_result(&other, &acks).is_some());
+        // строка на экране: pp, сумма аккаунта и разбивка по рукам
+        assert_eq!(
+            crate::screens::pp_line(pp).as_deref(),
+            Some("PP +172.6  ·  TOTAL 2760.6  ·  PEN 86.0 / MOUSE 86.6")
+        );
+        // пока ответа нет — «PP PENDING», а без входа в аккаунт строки нет
+        assert_eq!(
+            crate::screens::pp_line(crate::screens::ResultPp::Pending).as_deref(),
+            Some("PP PENDING")
+        );
+        assert_eq!(crate::screens::pp_line(crate::screens::ResultPp::Hidden), None);
+        // запись, которой нет в ответах прохода, ничего не обновляет
+        let absent = PendingScore::new("http://srv", "tk", serde_json::Map::new());
+        assert!(super::ack_for_result(&absent, &acks).is_none());
+        // тост загрузки показывает прибавку pp
+        assert_eq!(
+            super::upload_toast(Some(&ack)),
+            "Score uploaded · +172.6 pp"
+        );
+        assert_eq!(super::upload_toast(None), "Score uploaded");
     }
 }
 

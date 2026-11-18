@@ -2,12 +2,79 @@
 
 use crate::chart::{Chart, NoteKind};
 use crate::stage::note_x;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Judge {
     Perfect,
     Good,
     Miss,
+}
+
+/// Рука, которой сыграна нота. Та же конвенция, что у сервера:
+/// левая половина экрана (`pos < 0`) — перо/планшет, правая (`pos >= 0`) — мышь.
+pub const HAND_MOUSE: usize = 0;
+pub const HAND_TABLET: usize = 1;
+
+/// Рука ноты по её горизонтальной позиции (`Note::pos`).
+pub fn hand_of_pos(pos: f32) -> usize {
+    if pos < 0.0 { HAND_TABLET } else { HAND_MOUSE }
+}
+
+/// Счётчики судейства по одному устройству/руке.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandCounts {
+    #[serde(default)]
+    pub perfect: u32,
+    #[serde(default)]
+    pub good: u32,
+    #[serde(default)]
+    pub miss: u32,
+}
+
+impl HandCounts {
+    pub fn add(&mut self, j: Judge) {
+        match j {
+            Judge::Perfect => self.perfect += 1,
+            Judge::Good => self.good += 1,
+            Judge::Miss => self.miss += 1,
+        }
+    }
+
+    /// Всего рассуженных нот этой рукой (тесты/диагностика).
+    #[allow(dead_code)]
+    pub fn total(&self) -> u32 {
+        self.perfect + self.good + self.miss
+    }
+}
+
+/// Статистика по рукам. Сериализуется ровно в формат сервера:
+/// `{"mouse": {...}, "tablet": {...}}` (поле `hands` тела `POST /api/scores`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hands {
+    pub mouse: HandCounts,
+    pub tablet: HandCounts,
+}
+
+impl Hands {
+    /// Счётчики руки по её индексу ([`HAND_MOUSE`] / [`HAND_TABLET`]).
+    #[allow(dead_code)]
+    pub fn get_mut(&mut self, hand: usize) -> &mut HandCounts {
+        if hand == HAND_TABLET { &mut self.tablet } else { &mut self.mouse }
+    }
+
+    /// Добавить авто-Miss, которые `play.update` атрибутировал рукам по знаку
+    /// `pos` (у ноты нет устройства — рука выводится из её позиции).
+    pub fn fold_auto_miss(&mut self, play: &Play) {
+        self.mouse.miss += play.auto_miss[HAND_MOUSE];
+        self.tablet.miss += play.auto_miss[HAND_TABLET];
+    }
+
+    /// Всего нот по обеим рукам (тесты/диагностика).
+    #[allow(dead_code)]
+    pub fn total(&self) -> u32 {
+        self.mouse.total() + self.tablet.total()
+    }
 }
 
 /// Зашитые окна судейства. Раньше их можно было крутить в настройках; теперь
@@ -57,6 +124,9 @@ pub struct Play {
     /// тайминги только ТАПОВ (без слайдеров) — для калибровки оффсета:
     /// ошибка слайдера механическая (ранняя граница Z-окна), не индикатор синхронизации
     pub tap_errors: Vec<f32>,
+    /// Авто-Miss по рукам (индекс — [`hand_of_pos`]): в момент пропуска у ноты
+    /// нет устройства, поэтому рука берётся из знака её `pos`.
+    pub auto_miss: [u32; 2],
     /// скоринг Deemo (из 1_000_000): noteScore + comboScore
     note_score: f64,
     combo_score: f64,
@@ -94,6 +164,7 @@ impl Play {
             x_tol: X_TOLERANCE,
             errors: Vec::new(),
             tap_errors: Vec::new(),
+            auto_miss: [0; 2],
             note_score: 0.0,
             combo_score: 0.0,
             combo_stack: 0,
@@ -144,11 +215,13 @@ impl Play {
         self.score = (self.note_score + self.combo_score).round() as u64;
     }
 
-    /// Автоматические Miss для нот, ушедших за окно.
+    /// Автоматические Miss для нот, ушедших за окно. Каждый пропуск
+    /// засчитывается руке по знаку `pos` (статистика `hands` для сервера).
     pub fn update(&mut self, chart: &Chart, t: f32) {
         for (i, n) in chart.notes.iter().enumerate() {
             if !self.states[i].judged && t - n.time > self.miss {
                 let x = note_x(n.pos);
+                self.auto_miss[hand_of_pos(n.pos)] += 1;
                 self.apply(i, Judge::Miss, t, x, n.time);
             }
         }
@@ -235,6 +308,22 @@ impl Play {
         // т.е. процент от 1_000_000 с округлением до 2 знаков: round(score/100)/100.
         // Это achievement rate (включает комбо-бонус), не чистая точность попаданий.
         ((self.score as f64 / 100.0).round() / 100.0) as f32
+    }
+
+    /// Настоящая точность попаданий в процентах (0..100), osu!-стиль:
+    /// `(perfect + 0.5·good) / (perfect + good + miss)`.
+    ///
+    /// Это НЕ [`Play::accuracy`]: там achievement rate из счёта (с комбо-бонусом).
+    /// Авто-Miss из [`Play::update`] уже сидят в `counts[2]`, поэтому промахи
+    /// учитываются. Пустой чарт (ни одной рассуженной ноты) — `0.0`: судить
+    /// нечего, и это совпадает с «всё промазано» (0%).
+    pub fn hit_accuracy(&self) -> f32 {
+        let [perfect, good, miss] = self.counts;
+        let total = perfect + good + miss;
+        if total == 0 {
+            return 0.0;
+        }
+        ((perfect as f64 + 0.5 * good as f64) / total as f64 * 100.0) as f32
     }
 
     /// Средний тайминг попаданий (сек): + значит аудио отстаёт (жмём поздно).
@@ -392,5 +481,127 @@ mod tests {
         let mut p = Play::new(&c);
         assert!(!p.slide(&c, 1.0, 0.0, 6.5));
         assert!(!p.states[0].judged);
+    }
+
+    /// `pos < 0` — левая рука (перо/планшет), `pos >= 0` — правая (мышь):
+    /// та же конвенция, что у сервера в `hands`.
+    #[test]
+    fn hand_of_pos_splits_at_zero() {
+        assert_eq!(hand_of_pos(-0.01), HAND_TABLET);
+        assert_eq!(hand_of_pos(-3.0), HAND_TABLET);
+        assert_eq!(hand_of_pos(0.0), HAND_MOUSE);
+        assert_eq!(hand_of_pos(2.5), HAND_MOUSE);
+    }
+
+    /// Синтетический плей: тапы мышью, тап пером и авто-Miss, атрибутированные
+    /// по знаку `pos`. Сумма `hands` должна сойтись с `play.counts`.
+    #[test]
+    fn hands_accumulate_taps_and_auto_miss_by_pos() {
+        let c = Chart {
+            speed: 6.0,
+            notes: vec![
+                Note { time: 1.0, pos: 0.6, size: 1.0, speed: 1.0, kind: NoteKind::Normal, hold: 0.0, sounds: vec![] },
+                Note { time: 2.0, pos: -0.6, size: 1.0, speed: 1.0, kind: NoteKind::Normal, hold: 0.0, sounds: vec![] },
+                Note { time: 3.0, pos: 0.7, size: 1.0, speed: 1.0, kind: NoteKind::Normal, hold: 0.0, sounds: vec![] },
+                Note { time: 3.0, pos: -0.7, size: 1.0, speed: 1.0, kind: NoteKind::Normal, hold: 0.0, sounds: vec![] },
+            ],
+            links: vec![],
+        };
+        let mut p = Play::new(&c);
+        let mut hands = Hands::default();
+        // мышь: Perfect по правой ноте
+        let x = note_x(0.6);
+        let j = p.tap(&c, 1.0, x);
+        assert_eq!(j, Some(Judge::Perfect));
+        hands.mouse.add(j.unwrap());
+        // перо: Good по левой ноте (в окне Good, но вне Perfect)
+        let dt = (PERFECT_WINDOW + GOOD_WINDOW) * 0.5;
+        let x = note_x(-0.6);
+        let j = p.tap(&c, 2.0 + dt, x);
+        assert_eq!(j, Some(Judge::Good));
+        hands.tablet.add(j.unwrap());
+        // обе оставшиеся ноты уходят за окно — рука берётся из pos
+        p.update(&c, 3.0 + CLICK_WINDOW + 0.01);
+        assert_eq!(p.auto_miss, [1, 1], "one auto-miss per hand");
+        hands.fold_auto_miss(&p);
+
+        assert_eq!(hands.mouse, HandCounts { perfect: 1, good: 0, miss: 1 });
+        assert_eq!(hands.tablet, HandCounts { perfect: 0, good: 1, miss: 1 });
+        assert_eq!(hands.total(), p.counts.iter().sum::<u32>());
+        assert_eq!(p.counts, [1, 1, 2]);
+    }
+
+    /// Настоящая точность попаданий (не achievement): osu-стиль 0.5 за Good.
+    #[test]
+    fn hit_accuracy_weighs_good_and_counts_misses() {
+        let c = chart_with(&[1.0]);
+        let mut p = Play::new(&c);
+        // все Perfect → 100%
+        p.counts = [10, 0, 0];
+        assert!((p.hit_accuracy() - 100.0).abs() < 1e-4);
+        // половина Good, половина Perfect → 75%
+        p.counts = [5, 5, 0];
+        assert!((p.hit_accuracy() - 75.0).abs() < 1e-4);
+        // промахи в знаменателе: (2 + 0.5·1) / 10 = 25%
+        p.counts = [2, 1, 7];
+        assert!((p.hit_accuracy() - 25.0).abs() < 1e-4);
+        // всё промазано → 0%
+        p.counts = [0, 0, 4];
+        assert!(p.hit_accuracy().abs() < 1e-4);
+    }
+
+    /// Пустой чарт (ни одной рассуженной ноты): судить нечего → 0%, без NaN.
+    #[test]
+    fn hit_accuracy_of_an_empty_play_is_zero() {
+        let c = chart_with(&[]);
+        let p = Play::new(&c);
+        assert_eq!(p.counts, [0, 0, 0]);
+        assert!(p.hit_accuracy().is_finite());
+        assert_eq!(p.hit_accuracy(), 0.0);
+        // заодно старый achievement тоже не паникует
+        assert_eq!(p.accuracy(), 0.0);
+    }
+
+    /// Авто-Miss попадают в `miss`, поэтому точность проседает.
+    #[test]
+    fn hit_accuracy_includes_auto_missed_notes() {
+        let c = chart_with(&[1.0, 2.0]);
+        let mut p = Play::new(&c);
+        assert_eq!(p.tap(&c, 1.0, 0.0), Some(Judge::Perfect));
+        p.update(&c, 2.0 + CLICK_WINDOW + 0.01);
+        assert_eq!(p.counts, [1, 0, 1]);
+        assert!((p.hit_accuracy() - 50.0).abs() < 1e-4);
+    }
+
+    /// `hit_accuracy` и `accuracy` — разные числа: achievement учитывает комбо.
+    #[test]
+    fn achievement_is_not_hit_accuracy() {
+        let c = chart_with(&[1.0]);
+        let mut p = Play::new(&c);
+        p.counts = [10, 0, 0];
+        p.score = 900_000;
+        assert!((p.accuracy() - 90.0).abs() < 1e-4);
+        assert!((p.hit_accuracy() - 100.0).abs() < 1e-4);
+    }
+
+    /// Тело для сервера — ровно `{"mouse":{...},"tablet":{...}}` с именами
+    /// полей perfect/good/miss.
+    #[test]
+    fn hands_serialize_in_the_server_shape() {
+        let hands = Hands {
+            mouse: HandCounts { perfect: 300, good: 12, miss: 3 },
+            tablet: HandCounts { perfect: 280, good: 20, miss: 5 },
+        };
+        let v = serde_json::to_value(hands).unwrap();
+        assert_eq!(v["mouse"]["perfect"], 300);
+        assert_eq!(v["mouse"]["good"], 12);
+        assert_eq!(v["mouse"]["miss"], 3);
+        assert_eq!(v["tablet"]["perfect"], 280);
+        assert_eq!(v["tablet"]["good"], 20);
+        assert_eq!(v["tablet"]["miss"], 5);
+        assert_eq!(v.as_object().unwrap().len(), 2, "no extra keys");
+        // обратный разбор (нужен тестам и будущему чтению)
+        let back: Hands = serde_json::from_value(v).unwrap();
+        assert_eq!(back, hands);
     }
 }
