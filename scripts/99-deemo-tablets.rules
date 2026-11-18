@@ -1,5 +1,0 @@
-# Deemo: заставить libinput игнорировать эмуляцию мыши/клавиатуры планшетов,
-# чтобы перо не двигало системный курсор и не плодило фантомные клики.
-# Сами планшеты игра читает напрямую через hidraw — на это правило не влияет.
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="a019", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ATTRS{idVendor}=="256c", ATTRS{idProduct}=="006d", ENV{LIBINPUT_IGNORE_DEVICE}="1"

@@ -17,18 +17,21 @@ Both are used as the **left cursor** (the mouse drives the right one), and both
 can be connected at the same time — the game follows whichever one reported
 last.
 
-## Making the pen stop moving the system cursor
+## Why there is no udev rule
 
-Tablets also emulate a mouse through libinput, which makes the pen move the
-desktop cursor and fire phantom clicks. Install the bundled rule and replug the
-tablet:
+The obvious fix — telling libinput to ignore the tablet
+(`LIBINPUT_IGNORE_DEVICE=1` in a udev rule) — is the wrong one: it applies to the
+whole system, so the tablet stops working in every other application until udev
+is reloaded. Some tablet packages install such rules for their own virtual
+devices; that is their business, not a game's.
 
-```sh
-sudo cp scripts/99-deemo-tablets.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input
-```
+This game reads the pen straight from the raw HID device, so it never needs the
+system to hide anything. Instead it drops the *mouse* events the pen emulates:
+a click that arrives within a few milliseconds of a pen press (or while the pen
+is down) is ignored by the game, so the pen does not double-fire. Hovering does
+not suppress the mouse, which keeps the two-cursor setup working.
 
-The game reads the tablet through hidraw, so this rule does not affect it.
+Nothing to install, nothing to undo.
 
 ## Adding a tablet
 
