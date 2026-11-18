@@ -236,59 +236,21 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
 
     // фон: ночная комната + падающие клавиши (настоящие ноты, если играет превью)
     theme::fill(ui, white, [0.0, 0.0, w, h], theme::BG);
-    let bg = [
-        g.left_w + 12.0 * s,
-        g.top_h,
-        (w - 8.0 * s) - (g.left_w + 12.0 * s),
-        bottom_y - g.top_h,
-    ];
     let real_notes = v.bg_t.filter(|_| !v.bg_notes.is_empty());
+    // Поле падающих нот — ровно прямоугольник списка песен: ни шапки, ни
+    // обложки, ни титульного блока, ни нижней плашки. Один и тот же rect и
+    // для отрисовки, и для нитей слайдов.
+    let field = [g.rx, g.top_h, g.rw, bottom_y - g.top_h];
     if let Some(t) = real_notes {
-        // Мини-поле не заходит на арт и не трогает верхнюю панель: в
-        // библиотеке оно живёт только в колонке списка, в main — в фоне
-        // списка/титульного блока, но всегда ниже top_h.
-        let (field, dim) = if g.art.is_some() {
-            ([g.rx, g.top_h, g.rw, bottom_y - g.top_h], None)
-        } else if v.selected.is_none() {
-            // main: поле живёт по всему фону, но под титульным блоком
-            // приглушается, чтобы вордмарк оставался главным; нити слайдов
-            // ограничены колонкой списка (link_clip ниже)
-            let r = title_block_rect(g, w, bottom_y, s);
-            let pad = 20.0 * s;
-            (
-                [
-                    g.rx,
-                    g.top_h,
-                    (w - g.margin - g.rx).max(200.0 * s),
-                    bottom_y - g.top_h,
-                ],
-                Some((
-                    [r[0] - pad, r[1] - pad, r[2] + pad * 2.0, r[3] + pad * 2.0],
-                    0.35,
-                )),
-            )
-        } else {
-            (bg, None)
-        };
-        theme::chart_fall(
-            ui,
-            white,
-            field,
-            v.bg_notes,
-            t,
-            0.066,
-            s,
-            dim,
-            Some([g.rx, g.top_h, g.rw, bottom_y - g.top_h]),
-        );
+        theme::chart_fall(ui, white, field, v.bg_notes, t, 0.066, s, None, Some(field));
     } else {
         theme::falling_keys(
             ui,
             white,
-            bg[0],
-            bg[0] + bg[2],
-            bg[1],
-            bg[1] + bg[3],
+            field[0],
+            field[0] + field[2],
+            field[1],
+            field[1] + field[3],
             v.t,
             0x9e37_79b9,
             0.0016,
