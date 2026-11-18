@@ -485,13 +485,20 @@ impl App {
     }
 
     /// Фоновое декодирование миниатюр обложек, чтобы скролл не лагал.
+    /// Миниатюры, которых ещё нет в кэше (новые паки добавляются на лету).
+    fn missing_thumb_paths(&self) -> Vec<String> {
+        (0..self.songs.len())
+            .filter_map(|i| self.thumb_path(i))
+            .filter(|p| !self.covers.contains_key(p))
+            .collect()
+    }
+
     fn spawn_cover_preloader(&mut self) {
-        let paths: Vec<String> = self
-            .songs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, _)| self.thumb_path(i))
-            .collect();
+        let paths = self.missing_thumb_paths();
+        if paths.is_empty() {
+            return;
+        }
+        println!("thumbs: loading {} missing", paths.len());
         let (tx, rx) = std::sync::mpsc::channel();
         self.cover_rx = Some(rx);
         std::thread::spawn(move || {
@@ -775,6 +782,9 @@ impl App {
             }
             // сброс кэша полноразмерных артов, т.к. набор песен изменился
             self.full_dims.clear();
+            // новые паки (инбокс, F5, установка на лету) — догрузить их
+            // миниатюры без перезапуска игры
+            self.spawn_cover_preloader();
             // ноты фона тоже могли переехать — перечитаем при следующем кадре
             self.bg_key = None;
             self.bg_field.clear_source();
