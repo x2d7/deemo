@@ -905,7 +905,7 @@ mod tests {
             },
         };
         let rec = online
-            .pending_score(&song, "hard", &play, 7.7, &hands)
+            .pending_score(&song, "hard", &play, 7.7, &hands, None)
             .expect("pending score");
         let sent = serde_json::Value::Object(rec.body.clone());
         println!("POST {}\n{sent}", rec.url());

@@ -64,6 +64,47 @@ pub struct Online {
     pub state: AuthState,
 }
 
+/// Одна запись публичного списка реплеев карты (`GET .../replays`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ReplayEntry {
+    #[serde(default)]
+    pub nick: String,
+    #[serde(default)]
+    pub score: u64,
+    #[serde(default)]
+    pub pp: f64,
+    #[serde(default)]
+    pub accuracy: f64,
+    #[serde(default)]
+    pub timestamp: u64,
+    #[serde(default)]
+    pub notes: u32,
+}
+
+/// Разбор тела `/replays` (`{"max":25,"replays":[...]}`). Общий для сети и
+/// headless-фикстур, поэтому не прячется в [`Online`].
+pub fn parse_replays(v: &serde_json::Value) -> Result<Vec<ReplayEntry>, String> {
+    let list = v
+        .get("replays")
+        .ok_or("no replays in the server response")?;
+    serde_json::from_value::<Vec<ReplayEntry>>(list.clone()).map_err(|e| e.to_string())
+}
+
+/// Percent-encode one URL path segment (RFC 3986 unreserved bytes stay as-is).
+/// Ники могут содержать `%`, пробел и юникод — в путь их кладём только так.
+fn url_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 impl Online {
     pub fn load() -> Online {
         let mut state: AuthState = std::fs::read_to_string(AUTH_PATH)
@@ -126,16 +167,20 @@ impl Online {
     /// её показывает сайт), `achievement` — прежнее значение `Play::accuracy()`
     /// (achievement rate из счёта с комбо-бонусом). `score` остаётся в теле:
     /// сервер его хранит, хотя сайт для рейтинга берёт accuracy/pp.
+    ///
+    /// `replay` — base64 от DMR2 (см. [`crate::replay::dmr2_base64`]). `None` —
+    /// поля в теле нет совсем (старый сервер его игнорирует в любом случае).
     pub fn score_body(
         song: &str,
         diff: &str,
         play: &crate::play::Play,
         speed: f32,
         hands: &crate::play::Hands,
+        replay: Option<&str>,
     ) -> serde_json::Map<String, serde_json::Value> {
         let hit_acc = round2(play.hit_accuracy() as f64);
         let achievement = play.accuracy();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "song": song, "diff": diff,
             "score": play.score,
             "accuracy": hit_acc,
@@ -149,6 +194,9 @@ impl Online {
             "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             "hands": hands,
         });
+        if let (Some(replay), Some(obj)) = (replay.filter(|r| !r.is_empty()), body.as_object_mut()) {
+            obj.insert("replay".to_string(), serde_json::Value::String(replay.to_string()));
+        }
         body.as_object().cloned().unwrap_or_default()
     }
 
@@ -161,14 +209,48 @@ impl Online {
         play: &crate::play::Play,
         speed: f32,
         hands: &crate::play::Hands,
+        replay: Option<&str>,
     ) -> Option<crate::online_queue::PendingScore> {
         let token = self.state.token.clone()?;
-        let body = Self::score_body(song, diff, play, speed, hands);
+        let body = Self::score_body(song, diff, play, speed, hands, replay);
         Some(crate::online_queue::PendingScore::new(
             &self.state.server,
             &token,
             body,
         ))
+    }
+
+    /// Публичный список реплеев карты (топ-25, без авторизации).
+    pub fn replays(&self, pack: &str, diff: &str) -> Result<Vec<ReplayEntry>, String> {
+        let url = self.url(&format!(
+            "/api/packs/{}/chart/{}/replays",
+            url_segment(pack),
+            url_segment(diff)
+        ));
+        let resp = self.agent().get(&url).call().map_err(|e| fmt_err(e))?;
+        let v: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
+        parse_replays(&v)
+    }
+
+    /// Сырой DMR1/DMR2 одного игрока (публично). Пустое тело — ошибка.
+    pub fn replay_blob(&self, pack: &str, diff: &str, nick: &str) -> Result<Vec<u8>, String> {
+        let url = self.url(&format!(
+            "/api/packs/{}/chart/{}/replays/{}",
+            url_segment(pack),
+            url_segment(diff),
+            url_segment(nick)
+        ));
+        let resp = self.agent().get(&url).call().map_err(|e| fmt_err(e))?;
+        let mut blob = Vec::new();
+        use std::io::Read;
+        resp.into_reader()
+            .take(256 * 1024)
+            .read_to_end(&mut blob)
+            .map_err(|e| e.to_string())?;
+        if blob.is_empty() {
+            return Err("empty replay".into());
+        }
+        Ok(blob)
     }
 
     /// Лидерборд песни+сложности (топ игроков).
@@ -254,7 +336,7 @@ mod tests {
             mouse: HandCounts { perfect: 210, good: 9, miss: 4 },
             tablet: HandCounts { perfect: 202, good: 9, miss: 2 },
         };
-        let body = Online::score_body("12thchance", "hard", &play, 4.0, &hands);
+        let body = Online::score_body("12thchance", "hard", &play, 4.0, &hands, None);
         let v = serde_json::Value::Object(body);
         // старые поля не изменились
         assert_eq!(v["song"], "12thchance");
@@ -293,6 +375,174 @@ mod tests {
             h["mouse"].as_object().unwrap().len(),
             3,
             "only perfect/good/miss"
+        );
+    }
+
+    /// `replay` появляется в теле только когда плей и чарт одной длины:
+    /// кодировка отдаёт `None` при несовпадении, а `score_body` — не пишет ключ.
+    #[test]
+    fn score_body_has_replay_only_for_a_matching_chart() {
+        use crate::chart::{Chart, Note, NoteKind};
+        use crate::play::{Hands, Judge, Play};
+        let note = |t: f32| Note {
+            time: t,
+            pos: 0.5,
+            size: 1.0,
+            speed: 1.0,
+            kind: NoteKind::Normal,
+            hold: 0.0,
+            sounds: vec![],
+        };
+        let chart = Chart {
+            speed: 6.0,
+            notes: vec![note(1.0), note(2.0)],
+            links: vec![],
+        };
+        let mut play = Play::new(&chart);
+        play.states[0].judged = true;
+        play.states[0].result = Judge::Perfect;
+        play.states[0].hit_time = 1.01;
+        // позиция указателя в момент попадания — уедет в DMR2 x_note
+        play.states[0].pointer_x = crate::stage::note_x(0.5);
+        play.states[1].judged = true;
+        play.states[1].result = Judge::Miss;
+        play.states[1].hit_time = 2.3;
+        play.score = 500_000;
+        play.counts = [1, 0, 1];
+        let hands = Hands::default();
+
+        let b64 = crate::replay::dmr2_base64(&chart, &play, &[]).expect("same lengths");
+        let body = Online::score_body("song", "hard", &play, 4.0, &hands, Some(&b64));
+        let v = serde_json::Value::Object(body);
+        assert_eq!(v["replay"], b64.as_str());
+        let bytes = crate::replay::base64_decode(&b64).expect("base64");
+        let blob = crate::replay::ReplayBlob::decode(&bytes).expect("server-side blob");
+        assert_eq!(blob.format, crate::replay::ReplayFormat::Dmr2);
+        assert_eq!(blob.notes[0].delta, 10);
+        assert_eq!(blob.notes[0].x, 32, "0.5 pos quantized");
+        assert_eq!(blob.notes[1].x, crate::replay::DMR1_MISS);
+
+        // чарт длиннее плея (перезагрузили карту) — реплея нет и ключа нет
+        let longer = Chart {
+            speed: 6.0,
+            notes: vec![note(1.0), note(2.0), note(3.0)],
+            links: vec![],
+        };
+        assert!(
+            crate::replay::dmr2_base64(&longer, &play, &[]).is_none(),
+            "length mismatch must not encode"
+        );
+        let body = Online::score_body("song", "hard", &play, 4.0, &hands, None);
+        assert!(
+            body.get("replay").is_none(),
+            "no replay key without an encoded blob"
+        );
+    }
+
+    /// Список реплеев: ровно поля контракта, отсутствующие — дефолтами.
+    #[test]
+    fn replays_list_parses_the_frozen_shape() {
+        let v = serde_json::json!({
+            "max": 25,
+            "replays": [
+                {"nick":"piano_kid","score":987430,"pp":172.6,"accuracy":96.56,"timestamp":1794940377,"notes":1124},
+                {"nick":"mimi"}
+            ]
+        });
+        let list = parse_replays(&v).expect("list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].nick, "piano_kid");
+        assert_eq!(list[0].score, 987_430);
+        assert!((list[0].pp - 172.6).abs() < 1e-9);
+        assert_eq!(list[0].notes, 1124);
+        assert_eq!(list[1].nick, "mimi");
+        assert_eq!(list[1].score, 0);
+        assert!(parse_replays(&serde_json::json!({"max":25})).is_err());
+    }
+
+    /// Живой мини-сервер контракта: список и блоб идут по замороженным путям,
+    /// ник экранируется, тело блоба отдаётся байт-в-байт.
+    #[test]
+    fn replays_list_and_blob_use_the_frozen_paths() {
+        use crate::replay::{NoteShot, ReplayBlob, ReplayFormat, TrackPoint, DMR1_MISS};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let blob = ReplayBlob {
+            format: ReplayFormat::Dmr2,
+            notes: vec![
+                NoteShot { delta: 5, x: 10 },
+                NoteShot { delta: DMR1_MISS, x: DMR1_MISS },
+                NoteShot { delta: -7, x: -20 },
+            ],
+            track: vec![
+                TrackPoint { t: 0.0, x: 0.0 },
+                TrackPoint { t: 0.25, x: 1.0 },
+            ],
+        }
+        .encode_dmr2();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = blob.clone();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let first = req.lines().next().unwrap_or("").to_string();
+                let blob_resp = first.contains("/replays/");
+                seen.push(first);
+                let (ctype, body): (&str, Vec<u8>) = if blob_resp {
+                    ("application/octet-stream", served.clone())
+                } else {
+                    (
+                        "application/json",
+                        br#"{"max":25,"replays":[{"nick":"piano_kid","score":987430,"pp":172.6,"accuracy":96.56,"timestamp":1794940377,"notes":3}]}"#.to_vec(),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&body);
+                let _ = sock.flush();
+            }
+            seen
+        });
+        let on = Online {
+            state: AuthState {
+                server: format!("http://{addr}"),
+                token: None,
+                nickname: None,
+            },
+        };
+        let list = on.replays("12thchance", "hard").expect("list");
+        assert_eq!(list[0].nick, "piano_kid");
+        let got = on
+            .replay_blob("12thchance", "hard", "piano kid")
+            .expect("blob");
+        assert_eq!(got, blob, "blob must arrive byte-for-byte");
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen[0],
+            "GET /api/packs/12thchance/chart/hard/replays HTTP/1.1"
+        );
+        assert_eq!(
+            seen[1],
+            "GET /api/packs/12thchance/chart/hard/replays/piano%20kid HTTP/1.1"
         );
     }
 }

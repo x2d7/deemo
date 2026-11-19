@@ -17,14 +17,26 @@ see [TABLETS.md](TABLETS.md).
 
 ![song select](screenshots/main.png)
 
+## Replays
+
+A finished play is stored as a compact replay: per note, the timing error and
+the pointer position at the hit, plus a sampled cursor track. That is roughly
+6 KB for a two-minute chart. The best 25 plays per chart are kept on the server.
+
+Select a chart and press `Tab` to focus the replay list, `Up`/`Down` to choose,
+`Enter` to watch, `Esc` to leave. Playback runs on the same engine with input
+disabled: no result is written and no score is submitted.
+
+![replay](screenshots/replay.png)
+
 ## Install from release
 
-Download `deemo-0.1.0-linux-x86_64.tar.gz` from the
+Download `deemo-0.1.1-linux-x86_64.tar.gz` from the
 [releases page](https://github.com/x2d7/deemo/releases), then:
 
 ```sh
-tar xzf deemo-0.1.0-linux-x86_64.tar.gz
-cd deemo-0.1.0
+tar xzf deemo-0.1.1-linux-x86_64.tar.gz
+cd deemo-0.1.1
 ./deemo
 ```
 

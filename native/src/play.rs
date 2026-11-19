@@ -99,6 +99,9 @@ pub struct NoteState {
     pub hit_time: f32,
     /// note.time − hit_time: где нота была в момент попадания (для позиции эффекта)
     pub hit_dt: f32,
+    /// мировая X указателя в момент судейства; NaN — нота не сбита (мисс).
+    /// Пишется только для попаданий (Perfect/Good), в DMR2 едет как x_note.
+    pub pointer_x: f32,
 }
 
 #[derive(Clone)]
@@ -147,6 +150,7 @@ impl Play {
                     result: Judge::Miss,
                     hit_time: 0.0,
                     hit_dt: 0.0,
+                    pointer_x: f32::NAN,
                 };
                 chart.notes.len()
             ],
@@ -215,6 +219,31 @@ impl Play {
         self.score = (self.note_score + self.combo_score).round() as u64;
     }
 
+    /// Применить ноту из реплея без ввода: `hit_time` — записанное время
+    /// попадания (секунды карты). Судья выводится из той же разницы, что и у
+    /// тапа; промах приходит как `note.time + CLICK_WINDOW` от драйвера и
+    /// остаётся Miss. Повторный вызов по уже рассужденной ноте — no-op.
+    /// Возвращает итогового судью (для кольца нажатия в просмотре).
+    pub fn replay_hit(&mut self, chart: &Chart, i: usize, hit_time: f32) -> Judge {
+        let Some(n) = chart.notes.get(i) else {
+            return Judge::Miss;
+        };
+        if self.states.get(i).map(|s| s.judged).unwrap_or(true) {
+            return self.states.get(i).map(|s| s.result).unwrap_or(Judge::Miss);
+        }
+        let dt = (hit_time - n.time).abs();
+        let r = if dt <= self.perfect {
+            Judge::Perfect
+        } else if dt <= self.good {
+            Judge::Good
+        } else {
+            Judge::Miss
+        };
+        let x = note_x(n.pos);
+        self.apply(i, r, hit_time, x, n.time);
+        r
+    }
+
     /// Автоматические Miss для нот, ушедших за окно. Каждый пропуск
     /// засчитывается руке по знаку `pos` (статистика `hands` для сервера).
     pub fn update(&mut self, chart: &Chart, t: f32) {
@@ -257,6 +286,8 @@ impl Play {
         let nx = note_x(chart.notes[i].pos);
         self.apply(i, r, t, nx, chart.notes[i].time);
         if r != Judge::Miss {
+            // позиция указателя в момент судейства (для DMR2)
+            self.states[i].pointer_x = x;
             self.tap_errors.push(t - chart.notes[i].time);
         }
         Some(r)
@@ -292,6 +323,10 @@ impl Play {
             };
             let nx = note_x(n.pos);
             self.apply(i, r, t, nx, n.time);
+            if r != Judge::Miss {
+                // позиция указателя (та же для всех нот, сбитых одним слайдом)
+                self.states[i].pointer_x = x;
+            }
             hit = true;
         }
         hit

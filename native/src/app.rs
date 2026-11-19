@@ -51,6 +51,9 @@ enum Mode {
         clock: Clock,
         music_on: bool,
         paused: bool,
+        /// Some — не игра, а просмотр записанного реплея: ввод выключен,
+        /// ноты применяются драйвером, результат не отправляется.
+        driver: Option<crate::replay::ReplayDriver>,
     },
     Result {
         song: usize,
@@ -116,6 +119,39 @@ pub fn library_search_key(search: &mut String, key: &Key, in_library: bool) -> b
     match library_search_input(key) {
         Some(text) => push_search_text(search, &text),
         None => false,
+    }
+}
+
+/// Что клавиша делает со списком публичных реплеев в библиотеке.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplayListKey {
+    /// Tab — войти в список или вернуться к песням.
+    ToggleFocus,
+    Up,
+    Down,
+    /// Enter/Space — смотреть выбранный реплей.
+    Watch,
+    /// Esc/Backspace — снять фокус (без выхода из библиотеки).
+    Back,
+}
+
+/// Раскладка клавиш списка реплеев: без записей список не перехватывает
+/// ничего, поэтому Tab/Space продолжают работать как раньше.
+pub fn replay_list_action(key: &Key, focused: bool, count: usize) -> Option<ReplayListKey> {
+    if count == 0 {
+        return None;
+    }
+    match key {
+        Key::Named(NamedKey::Tab) => Some(ReplayListKey::ToggleFocus),
+        Key::Named(NamedKey::ArrowDown) if focused => Some(ReplayListKey::Down),
+        Key::Named(NamedKey::ArrowUp) if focused => Some(ReplayListKey::Up),
+        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) if focused => {
+            Some(ReplayListKey::Watch)
+        }
+        Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Backspace) if focused => {
+            Some(ReplayListKey::Back)
+        }
+        _ => None,
     }
 }
 
@@ -225,9 +261,19 @@ pub struct App {
     lb_online: bool,
     lb_records: Vec<crate::online::OnlineRecord>,
     lb_key: String,
-    lb_rx: Option<std::sync::mpsc::Receiver<(String, Vec<crate::online::OnlineRecord>)>>,
+    lb_rx: Option<std::sync::mpsc::Receiver<(String, Vec<crate::online::OnlineRecord>, Vec<crate::online::ReplayEntry>)>>,
     lb_pending: Option<String>,
     lb_toggle_rect: [f32; 4],
+    /// публичные реплеи выбранной карты: список, фокус клавиатуры и геометрия
+    /// строк (для кликов); ключ — song:diff последнего принятого списка
+    rp_records: Vec<crate::online::ReplayEntry>,
+    rp_key: String,
+    rp_sel: usize,
+    rp_focus: bool,
+    rp_rows: Vec<(usize, [f32; 4])>,
+    /// фоновая загрузка одного реплея (DMR1/DMR2): song, diff, nick, blob
+    rp_blob_rx: Option<Receiver<(usize, usize, String, std::result::Result<Vec<u8>, String>)>>,
+    rp_blob_pending: Option<(usize, usize, String)>,
     /// сигнатура папки data/imported (для авто-подхвата новых папок)
     imported_sig: u64,
     last_import_scan: Instant,
@@ -351,6 +397,9 @@ pub struct App {
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const DIM: [f32; 4] = [1.0, 1.0, 1.0, 0.6];
+/// Хвост после последней ноты в просмотре реплея (сек): эффект попадания и
+/// затухание успевают доиграть, результат не показывается.
+const REPLAY_TAIL: f32 = 1.5;
 
 impl App {
     fn new() -> Result<App> {
@@ -398,6 +447,13 @@ impl App {
             lb_rx: None,
             lb_pending: None,
             lb_toggle_rect: [0.0; 4],
+            rp_records: Vec::new(),
+            rp_key: String::new(),
+            rp_sel: 0,
+            rp_focus: false,
+            rp_rows: Vec::new(),
+            rp_blob_rx: None,
+            rp_blob_pending: None,
             imported_sig: 0,
             last_import_scan: Instant::now(),
             covers: HashMap::new(),
@@ -602,6 +658,17 @@ impl App {
     }
 
     fn start_play(&mut self, song: usize, diff: usize) {
+        let _ = self.start_play_impl(song, diff, None);
+    }
+
+    /// Запуск карты. `replay` — просмотр записанного DMR1/DMR2 вместо игры: драйвер
+    /// проверяет, что блоб описывает ровно этот чарт, и играет его без ввода.
+    fn start_play_impl(
+        &mut self,
+        song: usize,
+        diff: usize,
+        replay: Option<(&str, &crate::replay::ReplayBlob)>,
+    ) -> std::result::Result<(), String> {
         // запоминаем позицию библиотеки, чтобы вернуть её после игры
         if let Mode::Library { scroll, selected, diff: d } = &self.mode {
             self.saved_scroll = *scroll;
@@ -609,14 +676,29 @@ impl App {
             self.saved_diff = *d;
         }
         let Some(c) = self.songs[song].charts.get(diff) else {
-            return;
+            return Err("Chart is not available".into());
         };
         let chart_path = c.path.clone();
         let chart_diff = c.diff.clone();
-        let Ok(chart) = Chart::load(&chart_path) else {
-            return;
-        };
+        let chart = Chart::load(&chart_path)
+            .map_err(|_| "Chart is not available".to_string())?;
         let song_id = self.songs[song].id.clone();
+        // драйвер строится до смены режима: несовпадение числа нот оставляет
+        // игрока в библиотеке с короткой ошибкой, а не в чужом чарте
+        let driver = match replay {
+            Some((nick, blob)) => {
+                // decoded note_count обязан совпасть с чартом: иначе это блоб
+                // от другой версии карты и играть его нельзя
+                if blob.note_count() != chart.notes.len() {
+                    return Err("Replay does not match this chart".to_string());
+                }
+                Some(
+                    crate::replay::ReplayDriver::new(&chart, blob, nick)
+                        .map_err(|_| "Replay does not match this chart".to_string())?,
+                )
+            }
+            None => None,
+        };
         // локальные оффсеты карты относятся к song:diff — фиксируем ключ на всё
         // время плея (результат и кнопка на нём используют тот же ключ)
         self.play_key = (song_id.clone(), chart_diff.clone());
@@ -625,17 +707,22 @@ impl App {
         // lead-in: ноты успевают упасть сверху до первой ноты
         let lead_in = active_ahead_time(self.speed) + 0.5;
         let clock = Clock::new(lead_in, self.audio_offset_ms / 1000.0);
-        // реплей: пишем сырой ввод всей сессии (сохранение по F2)
-        self.replay = Some(crate::replay::Replay::new(
-            &song_id,
-            &chart_diff,
-            &self.songs[song].title,
-            &chart,
-            self.speed,
-            self.audio_offset_ms,
-            self.tablet_zoom,
-            self.x_tolerance,
-        ));
+        // реплей: пишем сырой ввод всей сессии (сохранение по F2). В просмотре
+        // реплея писать нечего — ввода нет.
+        self.replay = if driver.is_some() {
+            None
+        } else {
+            Some(crate::replay::Replay::new(
+                &song_id,
+                &chart_diff,
+                &self.songs[song].title,
+                &chart,
+                self.speed,
+                self.audio_offset_ms,
+                self.tablet_zoom,
+                self.x_tolerance,
+            ))
+        };
         let (input_mouse, input_tablet) = self.input_offsets();
         if let Some(r) = &mut self.replay {
             r.set_input_offsets(input_mouse, input_tablet);
@@ -658,6 +745,7 @@ impl App {
             clock,
             music_on: false,
             paused: false,
+            driver,
         };
         self.mouse_x = 0.0;
         self.music_ended_at = None;
@@ -671,6 +759,54 @@ impl App {
         self.gaomon_was_pressed = false;
         self.parblo_was_pressed = false;
         self.set_play_cursor(true);
+        Ok(())
+    }
+
+    /// Скачанный блоб → просмотр. Ошибки — коротким тостом, без выхода из
+    /// библиотеки: в чужой чарт или пустой экран игрок не попадает.
+    fn start_replay_play(&mut self, song: usize, diff: usize, nick: &str, bytes: &[u8]) {
+        let blob = match crate::replay::ReplayBlob::decode(bytes) {
+            Ok(b) => b,
+            Err(_) => {
+                self.toast = Some(("Replay unavailable".into(), Instant::now()));
+                return;
+            }
+        };
+        if let Err(msg) = self.start_play_impl(song, diff, Some((nick, &blob))) {
+            self.toast = Some((msg, Instant::now()));
+        }
+    }
+
+    /// Запросить блоб выбранной строки списка (сеть — в фоне, кадр не стоит).
+    fn start_replay_download(&mut self) {
+        let (si, diff) = match &self.mode {
+            Mode::Library { selected: Some(si), diff, .. } => (*si, *diff),
+            _ => return,
+        };
+        let Some(entry) = self.rp_records.get(self.rp_sel) else { return };
+        let nick = entry.nick.trim().to_string();
+        if nick.is_empty() {
+            return;
+        }
+        let key = (si, diff, nick.clone());
+        if self.rp_blob_pending.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(song_id) = self.songs.get(si).map(|s| s.id.clone()) else { return };
+        let diff_name = self
+            .songs
+            .get(si)
+            .and_then(|s| s.charts.get(diff))
+            .map(|c| c.diff.clone())
+            .unwrap_or_default();
+        let online = self.online.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rp_blob_rx = Some(rx);
+        self.rp_blob_pending = Some(key);
+        std::thread::spawn(move || {
+            let res = online.replay_blob(&song_id, &diff_name, &nick);
+            let _ = tx.send((si, diff, nick, res));
+        });
     }
 
     /// Превью песни в меню (отдельный ~20-сек клип <id>_pv из ассетов).
@@ -815,6 +951,11 @@ impl App {
     fn to_library(&mut self) {
         if let Some(g) = self.gfx.as_ref() {
             g.music.pause();
+        }
+        // выход из просмотра реплея возвращает фокус на его список: игрок
+        // сразу может выбрать следующий, без мыши
+        if matches!(&self.mode, Mode::Play { driver: Some(_), .. }) && !self.rp_records.is_empty() {
+            self.rp_focus = true;
         }
         self.mode = Mode::Library {
             scroll: self.saved_scroll,
@@ -1114,6 +1255,25 @@ impl App {
                 ));
             }
         }
+        // строки публичных реплеев: та же геометрия, что и у отрисовки
+        self.rp_rows.clear();
+        if selected.is_some() {
+            if !self.rp_records.is_empty() {
+                let rp = screens::replays_layout(
+                    &geom,
+                    hf - geom.bot_h,
+                    self.rp_records.len(),
+                    self.rp_sel,
+                );
+                self.rp_rows = rp.rows;
+            }
+        } else if !self.rp_records.is_empty() {
+            // без выбранной песни списка нет вовсе (и фокус не залипает)
+            self.rp_records.clear();
+            self.rp_key.clear();
+            self.rp_sel = 0;
+            self.rp_focus = false;
+        }
         self.lib_geom = Some(geom);
     }
 
@@ -1362,15 +1522,37 @@ impl ApplicationHandler for App {
         }
         self.next_frame = Instant::now() + std::time::Duration::from_secs_f64(1.0 / 120.0);
         self.drain_covers();
-        // онлайн-лидерборд: принять результат асинхронного запроса
+        // онлайн-лидерборд + реплеи: один ответ на карту
         if let Some(rx) = &self.lb_rx {
-            if let Ok((key, recs)) = rx.try_recv() {
-                self.lb_key = key;
-                self.lb_records = recs;
-                self.lb_pending = None;
-                self.lb_rx = None;
+            match rx.try_recv() {
+                Ok((key, recs, replays)) => {
+                    // пока грузили, могли выбрать другую карту — старый ответ мимо
+                    let same_chart = key
+                        .rsplit_once(':')
+                        .map(|(chart, _)| Some(chart) == self.chart_key().as_deref())
+                        .unwrap_or(false);
+                    if same_chart {
+                        self.lb_key = key;
+                        self.lb_records = recs;
+                        self.rp_key = self.chart_key().unwrap_or_default();
+                        self.rp_records = replays;
+                        self.rp_sel = self.rp_sel.min(self.rp_records.len().saturating_sub(1));
+                        if self.rp_records.is_empty() {
+                            self.rp_focus = false;
+                        }
+                    }
+                    self.lb_pending = None;
+                    self.lb_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    // поток умер, не прислав ответ: не блокируем следующие запросы
+                    self.lb_pending = None;
+                    self.lb_rx = None;
+                }
             }
         }
+        self.poll_replay_blob();
         // вход/регистрация из экрана настроек (фон)
         self.poll_auth();
         // фон меню: ноты выбранного чарта (фоновый поток)
@@ -1430,11 +1612,18 @@ impl App {
         // ветке `Key::Character` молча выбрасывает «!», «#», «(», «%» и прочую
         // пунктуацию («пробел/другие символы в поиске не печатаются»).
         if matches!(self.mode, Mode::Library { .. }) {
+            // фокус на публичных реплеях: Tab входит/выходит, Up/Down, Enter/Space
+            if self.replay_list_key(&key) {
+                return;
+            }
             // быстрая навигация: Home/End/PageUp/PageDown
             if self.list_key_nav(&key) {
                 return;
             }
             if library_search_key(&mut self.search, &key, true) {
+                // печатный ввод — снова поиск: фокус списка реплеев не должен
+                // перехватывать следующие пробелы
+                self.rp_focus = false;
                 if let Mode::Library { scroll, .. } = &mut self.mode {
                     *scroll = 0.0;
                 }
@@ -1466,6 +1655,9 @@ impl App {
             Key::Named(NamedKey::Backspace) => {
                 if matches!(self.mode, Mode::Library { .. }) {
                     self.search.pop();
+                } else if matches!(self.mode, Mode::Play { driver: Some(_), .. }) {
+                    // «назад» из просмотра реплея — как Esc, обратно к списку
+                    self.to_library();
                 }
             }
             Key::Named(NamedKey::Space) => self.toggle_pause(),
@@ -2156,6 +2348,23 @@ impl App {
         }
     }
 
+    /// Клавиши списка публичных реплеев (см. [`replay_list_action`]).
+    /// true — клавиша обработана и не должна идти дальше в поиск/хоткеи.
+    fn replay_list_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        let count = self.rp_records.len();
+        let Some(action) = replay_list_action(key, self.rp_focus, count) else {
+            return false;
+        };
+        match action {
+            ReplayListKey::ToggleFocus => self.rp_focus = !self.rp_focus,
+            ReplayListKey::Up => self.rp_sel = self.rp_sel.saturating_sub(1),
+            ReplayListKey::Down => self.rp_sel = (self.rp_sel + 1).min(count - 1),
+            ReplayListKey::Watch => self.start_replay_download(),
+            ReplayListKey::Back => self.rp_focus = false,
+        }
+        true
+    }
+
     fn on_click(&mut self) {
         let [px, py] = self.cursor;
         if self.settings.is_some() {
@@ -2210,8 +2419,9 @@ impl App {
             let tj = t + input_mouse / 1000.0;
             let mut judge = None;
             let mut err_ms = 0.0;
-            if let Mode::Play { chart, play, paused, .. } = &mut self.mode {
-                if !*paused {
+            if let Mode::Play { chart, play, paused, driver, .. } = &mut self.mode {
+                // в просмотре реплея ввод выключен: клик не судит ноты
+                if !*paused && driver.is_none() {
                     judge = play.tap(chart, tj, x);
                     // в выборку калибровки идут только попадания: у Miss
                     // `errors.last()` — это ошибка ПРЕДЫДУЩЕЙ ноты
@@ -2247,6 +2457,19 @@ impl App {
             _ => (None, 0),
         };
         let scroll = self.scroll();
+        // строка публичного реплея: клик = выбрать и смотреть (клавиатура —
+        // Tab/Up/Down/Enter, мышь лишь повторяет её путь)
+        if selected.is_some() && self.open_dropdown.is_none() {
+            let rows = self.rp_rows.clone();
+            for &(i, r) in &rows {
+                if in_rect(px, py, r) {
+                    self.rp_sel = i;
+                    self.rp_focus = true;
+                    self.start_replay_download();
+                    return;
+                }
+            }
+        }
         // открытый dropdown: выбор опции
         if self.open_dropdown.is_some() {
             let dd = self.open_dropdown.unwrap();
@@ -2398,7 +2621,8 @@ impl App {
         // (одни и те же для тапов и слайдов обоих устройств)
         let (input_mouse, input_tablet) = self.input_offsets();
         let mut to_result = None;
-        if let Mode::Play { chart, play, paused, song, diff, clock, music_on } = &mut self.mode {
+        let mut replay_done = false;
+        if let Mode::Play { chart, play, paused, song, diff, clock, music_on, driver } = &mut self.mode {
             if !*paused {
                 let g = self.gfx.as_ref().unwrap();
                 if !*music_on && clock.elapsed() >= clock.lead_in() {
@@ -2407,82 +2631,109 @@ impl App {
                     *music_on = g.music.duration() > 0.0;
                 }
                 let t = clock.time(g.music.time(), *music_on);
-                play.update(chart, t);
-                // раздельные оффсеты ввода: + сдвигает тап/слайд позже
-                let tm = t + input_mouse / 1000.0;
-                let tt = t + input_tablet / 1000.0;
-                // сырой планшет в реплей + тапы по press-edges (без покадровой
-                // задержки); у каждого планшета СВОЙ prev_press
-                let mut prev = [self.gaomon_was_pressed, self.parblo_was_pressed];
-                for e in &tablet_events {
-                    let et = clock.wall_to_time(e.wall);
-                    if let Some(r) = &mut self.replay {
-                        r.tablet(et, e);
+                if let Some(driver) = driver {
+                    // просмотр реплея: только записанные ноты, ввода и авто-Miss
+                    // нет; после последней ноты (+хвост) — сразу в библиотеку
+                    driver.apply(play, chart, t);
+                    if t > driver.end() + REPLAY_TAIL {
+                        replay_done = true;
                     }
-                    let slot = match e.kind {
-                        "gaomon" => 0,
-                        "parblo" => 1,
-                        _ => continue,
-                    };
-                    if tap_edge(&mut prev[slot], e.press) {
-                        let px = (e.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0);
-                        let tj = et + input_tablet / 1000.0;
-                        let j = play.tap(chart, tj, px);
-                        // только попадания: у Miss ошибка от прошлой ноты
-                        let hit = matches!(j, Some(Judge::Perfect) | Some(Judge::Good));
-                        let err = if hit {
-                            play.errors.last().copied().unwrap_or(0.0) * 1000.0
-                        } else {
-                            0.0
+                } else {
+                    play.update(chart, t);
+                    // позиция указателя этого кадра: активное перо важнее мыши
+                    let pointer_x = tablet_x.unwrap_or(self.mouse_x);
+                    // раздельные оффсеты ввода: + сдвигает тап/слайд позже
+                    let tm = t + input_mouse / 1000.0;
+                    let tt = t + input_tablet / 1000.0;
+                    // сырой планшет в реплей + тапы по press-edges (без покадровой
+                    // задержки); у каждого планшета СВОЙ prev_press
+                    let mut prev = [self.gaomon_was_pressed, self.parblo_was_pressed];
+                    for e in &tablet_events {
+                        let et = clock.wall_to_time(e.wall);
+                        if let Some(r) = &mut self.replay {
+                            r.tablet(et, e);
+                        }
+                        let slot = match e.kind {
+                            "gaomon" => 0,
+                            "parblo" => 1,
+                            _ => continue,
                         };
-                        if hit {
-                            self.tablet_tap_errors.push(err);
-                        }
-                        // статистика по рукам: тап стилуса = левая рука
-                        if let Some(j) = j {
-                            self.hands.tablet.add(j);
-                        }
-                        if let Some(r) = &mut self.replay {
-                            r.action(tj, 1, true, px, j, err);
-                        }
-                    }
-                }
-                self.gaomon_was_pressed = prev[0];
-                self.parblo_was_pressed = prev[1];
-                if held {
-                    let hit = play.slide(chart, tm, slide_x, self.speed);
-                    if hit {
-                        if let Some(r) = &mut self.replay {
-                            r.action(tm, 0, false, slide_x, None, 0.0);
-                        }
-                    }
-                }
-                if tablet_press {
-                    if let Some(px) = tablet_x {
-                        let hit = play.slide(chart, tt, px, self.speed);
-                        if hit {
+                        if tap_edge(&mut prev[slot], e.press) {
+                            let px = (e.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0);
+                            let tj = et + input_tablet / 1000.0;
+                            let j = play.tap(chart, tj, px);
+                            // только попадания: у Miss ошибка от прошлой ноты
+                            let hit = matches!(j, Some(Judge::Perfect) | Some(Judge::Good));
+                            let err = if hit {
+                                play.errors.last().copied().unwrap_or(0.0) * 1000.0
+                            } else {
+                                0.0
+                            };
+                            if hit {
+                                self.tablet_tap_errors.push(err);
+                            }
+                            // статистика по рукам: тап стилуса = левая рука
+                            if let Some(j) = j {
+                                self.hands.tablet.add(j);
+                            }
                             if let Some(r) = &mut self.replay {
-                                r.action(tt, 1, false, px, None, 0.0);
+                                r.action(tj, 1, true, px, j, err);
                             }
                         }
                     }
-                }
-                let dur = g.music.duration();
-                let mut finish =
-                    play.finished(chart, t) || (*music_on && dur > 0.0 && t >= dur - 0.05);
-                // надёжный финиш: музыка доиграла → grace 1.2 с реального времени
-                if *music_on && g.music.is_empty() {
-                    let at = *self.music_ended_at.get_or_insert_with(Instant::now);
-                    if at.elapsed().as_secs_f32() > 1.2 {
-                        finish = true;
+                    self.gaomon_was_pressed = prev[0];
+                    self.parblo_was_pressed = prev[1];
+                    if held {
+                        let hit = play.slide(chart, tm, slide_x, self.speed);
+                        if hit {
+                            if let Some(r) = &mut self.replay {
+                                r.action(tm, 0, false, slide_x, None, 0.0);
+                            }
+                        }
                     }
-                }
-                if finish {
-                    to_result = Some((*song, *diff, play.clone()));
+                    if tablet_press {
+                        if let Some(px) = tablet_x {
+                            let hit = play.slide(chart, tt, px, self.speed);
+                            if hit {
+                                if let Some(r) = &mut self.replay {
+                                    r.action(tt, 1, false, px, None, 0.0);
+                                }
+                            }
+                        }
+                    }
+                    // трек курсора: старт, каждые ~60 мс, при сдвиге ≥0.1 pos
+                    if let Some(r) = &mut self.replay {
+                        r.track_sample(t, pointer_x);
+                    }
+                    let dur = g.music.duration();
+                    let mut finish =
+                        play.finished(chart, t) || (*music_on && dur > 0.0 && t >= dur - 0.05);
+                    // надёжный финиш: музыка доиграла → grace 1.2 с реального времени
+                    if *music_on && g.music.is_empty() {
+                        let at = *self.music_ended_at.get_or_insert_with(Instant::now);
+                        if at.elapsed().as_secs_f32() > 1.2 {
+                            finish = true;
+                        }
+                    }
+                    if finish {
+                        // DMR2 уезжает вместе со скором; при разной длине
+                        // чарта и плея поля в теле просто нет
+                        let replay = match &mut self.replay {
+                            Some(r) => {
+                                r.track_end(t, pointer_x);
+                                crate::replay::dmr2_base64(chart, play, r.track())
+                            }
+                            None => None,
+                        };
+                        to_result = Some((*song, *diff, play.clone(), replay));
+                    }
                 }
             }
         }
-        if let Some((song, diff, play)) = to_result {
+        if replay_done {
+            // просмотр: без экрана результата и без отправки на сервер
+            self.to_library();
+        } else if let Some((song, diff, play, replay)) = to_result {
             self.gfx.as_ref().unwrap().music.pause();
             let diff_name = self.songs[song]
                 .charts
@@ -2519,7 +2770,7 @@ impl App {
             self.result_rec = None;
             if let Some(rec) =
                 self.online
-                    .pending_score(&song_id, &diff_name, &play, self.speed, &hands)
+                    .pending_score(&song_id, &diff_name, &play, self.speed, &hands, replay.as_deref())
             {
                 let server = rec.server.clone();
                 let seq = self.queue.enqueue(rec.clone(), &server);
@@ -2579,7 +2830,7 @@ impl App {
                 _ => (None, 0),
             };
             self.draw_library(&mut ui, selected, diff);
-        } else if let Mode::Play { chart, play, paused, song, diff, clock, .. } = &self.mode {
+        } else if let Mode::Play { chart, play, paused, song, diff, clock, driver, .. } = &self.mode {
             let t = clock.current();
             let mut scene = Scene::with_play(chart, self.speed, play);
             scene.guides = self.note_guides;
@@ -2588,14 +2839,20 @@ impl App {
             sprites = scene.sprites(t, w, h);
             screen[1].color = [1.0, 1.0, 1.0, scene.bg_mask_alpha(t)];
             // засечки на линии нажатия: мышь (голубая) + активный планшет
-            // (оранжевая; Gaomon и Parblo — равноправно, кто говорил последним)
-            let half = crate::stage::note_x(2.0);
-            sprites.push(crate::stage::marker(self.mouse_x, [0.3, 0.8, 1.0, 1.0], self.left_held));
-            if let Some(p) = self.tablets.as_ref().and_then(|t| t.active_state()) {
-                let x = (p.x_norm * 2.0 - 1.0) * half;
-                sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
+            // (оранжевая; Gaomon и Parblo — равноправно, кто говорил последним).
+            // В просмотре реплея ввода нет — засечек тоже.
+            if driver.is_none() {
+                let half = crate::stage::note_x(2.0);
+                sprites.push(crate::stage::marker(self.mouse_x, [0.3, 0.8, 1.0, 1.0], self.left_held));
+                if let Some(p) = self.tablets.as_ref().and_then(|t| t.active_state()) {
+                    let x = (p.x_norm * 2.0 - 1.0) * half;
+                    sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
+                }
+            } else if let Some(driver) = driver {
+                // курсор/DMR2: точка по треку + кольцо на попадании
+                crate::scene::push_replay_cursor(&mut sprites, driver, t);
             }
-            self.draw_hud(&mut ui, *song, *diff, play, t, *paused);
+            self.draw_hud(&mut ui, *song, *diff, play, t, *paused, driver.as_ref());
         } else if let Mode::Result { song, diff, play } = &self.mode {
             self.draw_result(&mut ui, *song, *diff, play);
         } else if matches!(self.mode, Mode::Login { .. }) {
@@ -2669,12 +2926,17 @@ impl App {
         let (w, h) = self.size();
         let wf = w as f32;
         let hf = h as f32;
-        // онлайн-лидерборд: запрос до захвата ссылок на поля (избегаем borrow-конфликта)
-        if self.lb_online && self.online.logged_in() {
+        // онлайн-лидерборд и публичные реплеи: один фоновый запрос на карту.
+        // Запрос нужен и без входа в аккаунт (список реплеев публичный), но
+        // в headless-скриншотах сеть не трогаем — берём фикстуру.
+        if self.gfx.is_some() {
             if let Some(si) = selected {
-                let sid = self.songs[si].id.clone();
-                let dn = self.songs[si].charts.get(diff).map(|c| c.diff.clone()).unwrap_or_default();
-                self.request_leaderboard(&sid, &dn);
+                if let Some(chart) = self.songs[si].charts.get(diff) {
+                    let sid = self.songs[si].id.clone();
+                    let dn = chart.diff.clone();
+                    let want_lb = self.lb_online && self.online.logged_in();
+                    self.request_leaderboard(&sid, &dn, want_lb);
+                }
             }
         }
 
@@ -2781,6 +3043,9 @@ impl App {
             lb_online: self.lb_online,
             lb_pending,
             lb_records: &self.lb_records,
+            replays: &self.rp_records,
+            replay_sel: self.rp_sel,
+            replay_focus: self.rp_focus,
             hist_rects: &self.hist_diff_rects,
             diff_rects: &self.diff_rects,
             dropdown,
@@ -2842,8 +3107,61 @@ impl App {
         }
     }
 
-    fn request_leaderboard(&mut self, song: &str, diff: &str) {
-        let key = format!("{song}:{diff}");
+    /// `song:diff` выбранной карты (для сопоставления ответов сети).
+    fn chart_key(&self) -> Option<String> {
+        let Mode::Library { selected: Some(si), diff, .. } = &self.mode else {
+            return None;
+        };
+        let song = self.songs.get(*si)?;
+        let chart = song.charts.get(*diff)?;
+        Some(format!("{}:{}", song.id, chart.diff))
+    }
+
+    /// Принять скачанный блоб (DMR1/DMR2; вызывается каждый кадр, как lb_rx).
+    fn poll_replay_blob(&mut self) {
+        let Some(rx) = &self.rp_blob_rx else { return };
+        match rx.try_recv() {
+            Ok((song, diff, nick, res)) => {
+                self.rp_blob_rx = None;
+                self.rp_blob_pending = None;
+                // пока качали, могли уйти из библиотеки или сменить карту —
+                // не стартуем вслепую
+                if self.settings.is_some() {
+                    return;
+                }
+                let current = match &self.mode {
+                    Mode::Library { selected: Some(si), diff, .. } => Some((*si, *diff)),
+                    _ => None,
+                };
+                if current != Some((song, diff)) {
+                    return;
+                }
+                match res {
+                    Ok(bytes) => self.start_replay_play(song, diff, &nick, &bytes),
+                    Err(_) => {
+                        self.toast = Some(("Replay unavailable".into(), Instant::now()));
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.rp_blob_rx = None;
+                self.rp_blob_pending = None;
+            }
+        }
+    }
+
+    /// Один фоновый запрос на карту: лидерборд (если он сейчас показан) и
+    /// публичный список реплеев. Оба едут в одном потоке и одним сообщением.
+    fn request_leaderboard(&mut self, song: &str, diff: &str, want_lb: bool) {
+        let chart_key = format!("{song}:{diff}");
+        // список другой карты не должен висеть, пока грузится этот
+        if self.rp_key != chart_key && !self.rp_records.is_empty() {
+            self.rp_records.clear();
+            self.rp_sel = 0;
+            self.rp_focus = false;
+        }
+        let key = format!("{chart_key}:{}", u8::from(want_lb));
         if self.lb_key == key || self.lb_pending.as_deref() == Some(key.as_str()) {
             return;
         }
@@ -2854,8 +3172,14 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.lb_rx = Some(rx);
         std::thread::spawn(move || {
-            let recs = on.leaderboard(&song, &diff, 20).unwrap_or_default();
-            let _ = tx.send((key, recs));
+            let recs = if want_lb {
+                on.leaderboard(&song, &diff, 20).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            // ошибка/пусто — так же «нет списка»: лишнего блока в панели нет
+            let replays = on.replays(&song, &diff).unwrap_or_default();
+            let _ = tx.send((key, recs, replays));
         });
     }
 
@@ -2899,13 +3223,26 @@ impl App {
         self.login_rects = rects;
     }
 
-    fn draw_hud(&self, ui: &mut Vec<UiQuad>, song: usize, diff: usize, play: &Play, t: f32, paused: bool) {
+    fn draw_hud(
+        &self,
+        ui: &mut Vec<UiQuad>,
+        song: usize,
+        diff: usize,
+        play: &Play,
+        t: f32,
+        paused: bool,
+        replay: Option<&crate::replay::ReplayDriver>,
+    ) {
         let (w, h) = self.size();
         let text = self.text.as_ref().expect("font");
         let s = &self.songs[song];
         // Игровой HUD не менялся: те же позиции, кегли и цвета.
         text.draw(&s.title, 24.0, 18.0, 20.0, WHITE, ui);
         text.draw(&s.composer, 24.0, 44.0, 13.0, DIM, ui);
+        // просмотр реплея: только подпись «REPLAY · ник» и время
+        if let Some(driver) = replay {
+            screens::draw_replay_badge(text, ui, &driver.nick, t, driver.end());
+        }
         let score = format!("{:08}", play.score);
         let sw = text.measure(&score, 26.0);
         text.draw(&score, w as f32 - sw - 24.0, 18.0, 26.0, WHITE, ui);
@@ -3099,6 +3436,24 @@ pub fn shot_screen(
     app.fade_x_ui = fx;
     app.fade_y_ui = fy;
     app.headless_size = (width, height);
+    // headless: список реплеев из фикстуры — сеть в шотах не трогаем.
+    // DEEMO_SHOT_REPLAYS=<json с {"replays":[...]}>; DEEMO_SHOT_REPLAY_SEL
+    // выбирает строку, DEEMO_SHOT_REPLAY_FOCUS=1 — состояние фокуса.
+    if let Ok(path) = std::env::var("DEEMO_SHOT_REPLAYS") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Ok(list) = crate::online::parse_replays(&v) {
+                    app.rp_sel = std::env::var("DEEMO_SHOT_REPLAY_SEL")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0)
+                        .min(list.len().saturating_sub(1));
+                    app.rp_focus = std::env::var("DEEMO_SHOT_REPLAY_FOCUS").is_ok();
+                    app.rp_records = list;
+                }
+            }
+        }
+    }
     // фиксированная фаза мотива, чтобы скриншоты были воспроизводимы
     app.anim_start = Instant::now() - std::time::Duration::from_secs_f32(5.0);
 
@@ -3206,10 +3561,12 @@ pub fn shot_screen(
                 app.mode = Mode::Result { song: sel, diff, play };
             }
             if screen == "replay" {
-                toast = Some(format!(
-                    "Replay saved: data/replays/{}_hard.json",
-                    app.songs.get(sel).map(|s| s.id.clone()).unwrap_or_default()
-                ));
+                if let Some(s) = app.songs.get(sel) {
+                    toast = Some(format!(
+                        "Replay saved: data/replays/{}_hard.json",
+                        s.id
+                    ));
+                }
             }
         }
         "settings" => {
@@ -3300,6 +3657,7 @@ pub fn shot_screen(
         _ => {
             app.mode = Mode::Library {
                 scroll: 0.0,
+                // без чартов выбирать нечего — библиотека рисуется пустой
                 selected: if app.songs.is_empty() { None } else { Some(sel) },
                 diff,
             };
@@ -3402,7 +3760,7 @@ pub fn shot_screen(
             sprites = scene.sprites(t, width, height);
             screen_q[1].color = [1.0, 1.0, 1.0, scene.bg_mask_alpha(t)];
             sprites.push(crate::stage::marker(app.mouse_x, [0.3, 0.8, 1.0, 1.0], app.left_held));
-            app.draw_hud(&mut ui, *song, *diff, play, t, *paused);
+            app.draw_hud(&mut ui, *song, *diff, play, t, *paused, None);
         }
         Mode::Result { song, diff, play } => {
             app.draw_result(&mut ui, *song, *diff, play);
@@ -3512,7 +3870,7 @@ pub fn run() -> Result<()> {
             if let Some(r) = &mut app.replay {
                 r.set_input_offsets(app.mouse_offset_ms, app.tablet_offset_ms);
             }
-            app.mode = Mode::Play { song: 0, diff: 0, chart, play, clock, music_on: false, paused: false };
+            app.mode = Mode::Play { song: 0, diff: 0, chart, play, clock, music_on: false, paused: false, driver: None };
         }
     }
     let _ = &app;
@@ -3559,6 +3917,59 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{queue_toast, tap_edge};
+
+    /// Список реплеев достижим и покидаем только клавиатурой: Tab входит и
+    /// выходит, стрелки/Enter работают лишь в фокусе, Esc/Backspace снимают
+    /// фокус. Без записей список не перехватывает ни одну клавишу.
+    #[test]
+    fn replay_list_is_keyboard_only_and_not_a_trap() {
+        use super::{replay_list_action, ReplayListKey};
+        use winit::keyboard::{Key, NamedKey};
+        use NamedKey as N;
+        let key = |k: NamedKey| Key::Named(k);
+
+        assert_eq!(
+            replay_list_action(&key(N::Tab), false, 3),
+            Some(ReplayListKey::ToggleFocus)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::Tab), true, 3),
+            Some(ReplayListKey::ToggleFocus),
+            "Tab leaves the list too"
+        );
+        assert_eq!(
+            replay_list_action(&key(N::ArrowDown), true, 3),
+            Some(ReplayListKey::Down)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::ArrowUp), true, 3),
+            Some(ReplayListKey::Up)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::Enter), true, 3),
+            Some(ReplayListKey::Watch)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::Space), true, 3),
+            Some(ReplayListKey::Watch)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::Escape), true, 3),
+            Some(ReplayListKey::Back)
+        );
+        assert_eq!(
+            replay_list_action(&key(N::Backspace), true, 3),
+            Some(ReplayListKey::Back)
+        );
+        // вне фокуса стрелки/Enter/Space остаются прежними хоткеями и поиском
+        for k in [N::ArrowUp, N::ArrowDown, N::Enter, N::Space, N::Escape] {
+            assert_eq!(replay_list_action(&key(k), false, 3), None, "{k:?}");
+        }
+        // пустой список ничего не съедает: Tab/Space работают как раньше
+        for k in [N::Tab, N::ArrowUp, N::ArrowDown, N::Enter, N::Space] {
+            assert_eq!(replay_list_action(&key(k), false, 0), None, "{k:?}");
+        }
+    }
 
     #[test]
     fn tablet_tap_fires_once_per_press() {

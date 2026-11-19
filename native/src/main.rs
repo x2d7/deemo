@@ -74,13 +74,38 @@ fn shot(
     width: u32,
     height: u32,
     autohit: bool,
+    replay_path: Option<&str>,
+    replay_nick: &str,
 ) -> Result<()> {
     let gpu = Gpu::new(None)?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(gpu.device, gpu.queue, format)?;
 
     let chart = Chart::load(chart_path)?;
-    let play = if autohit {
+    // --replay: заранее разобранный DMR1/DMR2 вместо синтетического autohit-плея
+    let blob = match replay_path {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("replay does not read {path}"))?;
+            let blob = replay::ReplayBlob::decode(&bytes).map_err(|e| anyhow::anyhow!(e))?;
+            if blob.note_count() != chart.notes.len() {
+                anyhow::bail!(
+                    "replay has {} notes, chart has {}",
+                    blob.note_count(),
+                    chart.notes.len()
+                );
+            }
+            Some(blob)
+        }
+        None => None,
+    };
+    let (play, driver) = if let Some(blob) = &blob {
+        let mut p = play::Play::new(&chart);
+        let mut d = replay::ReplayDriver::new(&chart, blob, replay_nick)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        d.apply(&mut p, &chart, time);
+        (Some(p), Some(d))
+    } else if autohit {
         let offset: f32 = std::env::var("DEEMO_HIT_OFFSET")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -98,9 +123,9 @@ fn shot(
                 p.states[i].hit_dt = offset;
             }
         }
-        Some(p)
+        (Some(p), None)
     } else {
-        None
+        (None, None)
     };
     let scene = match &play {
         Some(p) => Scene::with_play(&chart, speed, p),
@@ -108,7 +133,11 @@ fn shot(
     };
     let aspect = width as f32 / height as f32;
     renderer.set_camera(&scene.mvp(aspect));
-    let sprites = scene.sprites(time, width, height);
+    let mut sprites = scene.sprites(time, width, height);
+    // DMR2: точка курсора и кольцо нажатия — тот же код, что в игровом цикле
+    if let Some(d) = &driver {
+        scene::push_replay_cursor(&mut sprites, d, time);
+    }
     let screen = [
         render::ScreenQuad {
             tex: stage::Tex::Bg,
@@ -119,6 +148,14 @@ fn shot(
             color: [1.0, 1.0, 1.0, scene.bg_mask_alpha(time)],
         },
     ];
+    // метка просмотра — только для --replay; путь без него не меняется
+    let mut ui = Vec::new();
+    if let Some(d) = &driver {
+        renderer.set_ui_size(width, height);
+        let mut text = text::Text::new(&mut renderer)?;
+        screens::draw_replay_badge(&text, &mut ui, &d.nick, time, d.end());
+        text.flush(&mut renderer);
+    }
 
     let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot"),
@@ -138,7 +175,7 @@ fn shot(
     let mut encoder = renderer
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shot") });
-    renderer.draw(&mut encoder, &view, &sprites, &screen, &[]);
+    renderer.draw(&mut encoder, &view, &sprites, &screen, &ui);
 
     let padded_row = (width * 4).div_ceil(256) * 256;
     let readback = renderer.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1060,7 +1097,19 @@ fn main() -> Result<()> {
         let time: f32 = get("--time").and_then(|v| v.parse().ok()).unwrap_or(3.0);
         let speed: f32 = get("--speed").and_then(|v| v.parse().ok()).unwrap_or(4.0);
         let autohit = args.iter().any(|a| a == "--autohit");
-        return shot(&out, &chart_path, time, speed, width, height, autohit);
+        let replay_path = get("--replay");
+        let replay_nick = get("--replay-nick").unwrap_or_else(|| "player".to_string());
+        return shot(
+            &out,
+            &chart_path,
+            time,
+            speed,
+            width,
+            height,
+            autohit,
+            replay_path.as_deref(),
+            &replay_nick,
+        );
     }
 
     if args.iter().any(|a| a == "--x11") {

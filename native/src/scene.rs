@@ -298,3 +298,102 @@ impl<'a> Scene<'a> {
         out
     }
 }
+
+/// Курсор просмотра DMR2: затухающий хвост по треку, точка и кольцо нажатия.
+///
+/// Только `push` в уже существующий `out`: ни новых векторов, ни аллокаций
+/// на кадр. Точка на кадре попадания берётся из `x_note` (см.
+/// [`crate::replay::ReplayDriver::cursor_x`]), хвост — из трека.
+pub fn push_replay_cursor(
+    out: &mut Vec<Sprite>,
+    driver: &crate::replay::ReplayDriver,
+    t: f32,
+) {
+    if !driver.has_cursor() {
+        return;
+    }
+    const TRAIL_TIME: f32 = 0.4;
+    const TRAIL_DOTS: usize = 12;
+    let track = driver.track();
+    if track.len() >= 2 {
+        let start = track.partition_point(|p| p.t < t - TRAIL_TIME);
+        let end = track.partition_point(|p| p.t <= t);
+        let n = end.saturating_sub(start);
+        if n > 1 {
+            // не больше TRAIL_DOTS точек на хвост, равномерно по окну
+            let step = (n / TRAIL_DOTS).max(1);
+            let mut i = start;
+            while i < end {
+                let p = track[i];
+                let age = (t - p.t).max(0.0);
+                let k = (1.0 - age / TRAIL_TIME).clamp(0.0, 1.0);
+                if k > 0.02 {
+                    let size = 0.09 + 0.09 * k;
+                    let mut s = Sprite::tilted(
+                        Tex::Glow,
+                        [note_x(p.x), 0.0, 0.0],
+                        size,
+                        size,
+                        std::f32::consts::FRAC_PI_2,
+                        [0.5, 0.5],
+                        [0.45, 0.78, 1.0, 0.18 * k],
+                    );
+                    // обычный alpha blend: голубой хвост виден и на белом фоне
+                    s.additive = false;
+                    out.push(s);
+                }
+                i += step;
+            }
+        }
+    }
+    // кольцо живёт PRESS_RING секунд после реального попадания. Рисуем его
+    // 12 короткими отрезками по полу: текстуры кольца в ассетах нет, а
+    // несколько квадов дешевле полноценной геометрии. Холодный цвет
+    // контрастирует с тёплым hit-эффектом ноты.
+    if let Some((px, age)) = driver.press(t) {
+        let k = (age / crate::replay::PRESS_RING).clamp(0.0, 1.0);
+        let radius = 0.10 + 0.30 * k.sqrt();
+        let alpha = (1.0 - k).powf(0.7) * 0.9;
+        let x = note_x(px);
+        let segs = 12usize;
+        let step = std::f32::consts::TAU / segs as f32;
+        for s in 0..segs {
+            let a0 = s as f32 * step;
+            let a1 = (s + 1) as f32 * step;
+            let p0 = [x + radius * a0.cos(), radius * a0.sin()];
+            let p1 = [x + radius * a1.cos(), radius * a1.sin()];
+            out.push(Sprite::floor_line(
+                Tex::White,
+                p0,
+                p1,
+                0.03,
+                [0.35, 0.85, 1.0, alpha],
+            ));
+        }
+    }
+    // точка всегда на курсоре (на кадре попадания — ровно на x_note)
+    if let Some(px) = driver.cursor_x(t) {
+        let x = note_x(px);
+        let mut glow = Sprite::tilted(
+            Tex::Glow,
+            [x, 0.0, 0.0],
+            0.50,
+            0.50,
+            std::f32::consts::FRAC_PI_2,
+            [0.5, 0.5],
+            [1.0, 0.86, 0.52, 0.75],
+        );
+        glow.additive = true;
+        out.push(glow);
+        // белое ядро: точка читается и на светлом фоне
+        out.push(Sprite::tilted(
+            Tex::White,
+            [x, 0.0, 0.0],
+            0.07,
+            0.07,
+            std::f32::consts::FRAC_PI_2,
+            [0.5, 0.5],
+            [1.0, 0.97, 0.90, 1.0],
+        ));
+    }
+}

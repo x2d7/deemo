@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::library::Song;
-use crate::online::{Online, OnlineRecord};
+use crate::online::{Online, OnlineRecord, ReplayEntry};
 use crate::render::UiQuad;
 use crate::results::{fmt_date, Results};
 use crate::text::{Face, Text};
@@ -214,6 +214,11 @@ pub struct LibraryView<'a> {
     pub lb_online: bool,
     pub lb_pending: bool,
     pub lb_records: &'a [OnlineRecord],
+    /// публичные реплеи карты (топ-25); пусто — секции нет вовсе
+    pub replays: &'a [ReplayEntry],
+    /// выбранная строка списка реплеев и фокус клавиатуры на нём
+    pub replay_sel: usize,
+    pub replay_focus: bool,
     pub hist_rects: &'a [(usize, [f32; 4])],
     pub diff_rects: &'a [(usize, [f32; 4])],
     pub dropdown: Option<Dropdown<'a>>,
@@ -322,7 +327,11 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     );
 
     // === левая колонка: рекорды ===
-    draw_records(ctx, v, ui, bottom_y);
+    // Реплеи прижаты к низу панели: история/лидерборд не рисуются ниже их
+    // верхней границы. Пустой список ничего не сдвигает и не рисует.
+    let rp = replays_layout(g, bottom_y, v.replays.len(), v.replay_sel);
+    draw_records(ctx, v, ui, rp.top);
+    draw_replays(ctx, v, ui, &rp);
 
     // === титульный блок, когда песня не выбрана (main) ===
     if v.selected.is_none() {
@@ -432,8 +441,7 @@ fn draw_topbar(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     let _ = w;
 }
 
-fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32) {
-    let text = ctx.text;
+fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32) {    let text = ctx.text;
     let white = ctx.white;
     let s = ctx.s;
     let lw = v.geom.left_w;
@@ -567,6 +575,128 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
         let sub = format!("{} MISS · {}", r.miss, fmt_date(r.timestamp));
         draw_record_row(ctx, ui, y, x, right, &fmt_score_local(r.score, true), &r.rank, r.score, r.accuracy, &sub);
         y += 44.0 * s;
+    }
+}
+
+/// Компактный список реплеев в левой панели.
+///
+/// Четыре видимые строки — остальные доступны стрелками по фокусу (Tab):
+/// 25 записей не должны растягивать панель и выдавливать рекорды.
+pub const REPLAY_VISIBLE: usize = 4;
+
+pub struct ReplaysUi {
+    /// Верх секции; история/лидерборд заканчиваются выше.
+    pub top: f32,
+    pub rows: Vec<(usize, [f32; 4])>,
+    pub total: usize,
+}
+
+/// Геометрия секции REPLAYS — одна и та же для отрисовки и кликов.
+pub fn replays_layout(g: &LibGeom, bottom_y: f32, count: usize, sel: usize) -> ReplaysUi {
+    if count == 0 {
+        return ReplaysUi {
+            top: bottom_y,
+            rows: Vec::new(),
+            total: 0,
+        };
+    }
+    let s = g.s;
+    let row_h = 24.0 * s;
+    let head_h = 18.0 * s;
+    let visible = count.min(REPLAY_VISIBLE);
+    let top = bottom_y - (head_h + visible as f32 * row_h + 4.0 * s);
+    // окно из visible строк всегда содержит выбранную
+    let first = (sel + 1).saturating_sub(visible).min(count - visible);
+    let rows = (0..visible)
+        .map(|k| {
+            (
+                first + k,
+                [
+                    g.margin,
+                    top + head_h + 2.0 * s + k as f32 * row_h,
+                    g.left_w - g.margin * 2.0,
+                    row_h - 2.0 * s,
+                ],
+            )
+        })
+        .collect();
+    ReplaysUi {
+        top,
+        rows,
+        total: count,
+    }
+}
+
+fn draw_replays(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, rp: &ReplaysUi) {
+    if v.replays.is_empty() {
+        return;
+    }
+    let text = ctx.text;
+    let white = ctx.white;
+    let s = ctx.s;
+    let x = v.geom.margin;
+    let right = v.geom.left_w - v.geom.margin;
+    let head = if rp.total > rp.rows.len() {
+        format!("REPLAYS · {}", rp.total)
+    } else {
+        "REPLAYS".to_string()
+    };
+    // подсказка клавиатуры в правом краю заголовка (как «ENTER» у кнопок)
+    let hint = if v.replay_focus { "UP/DOWN · ENTER" } else { "TAB" };
+    let hw = text.measure_tracked(Face::Serif, hint, 8.0 * s, 1.0 * s);
+    let head_col = if v.replay_focus { ACCENT_INK } else { INK_FAINT };
+    theme::label(text, ui, &head, x, rp.top, 11.0 * s, 2.6 * s, head_col);
+    let head_w = text.measure_tracked(Face::Serif, &head, 11.0 * s, 2.6 * s);
+    let rule_x = x + head_w + 14.0 * s;
+    let rule_w = (right - hw - 10.0 * s - rule_x).max(0.0);
+    theme::hair_h(ui, white, rule_x, rp.top + 7.0 * s, rule_w, RULE, s);
+    text.draw_tracked(
+        Face::Serif,
+        hint,
+        (right - hw).max(x),
+        rp.top + 2.0 * s,
+        8.0 * s,
+        1.0 * s,
+        if v.replay_focus { INK_DIM } else { INK_FAINT },
+        ui,
+    );
+
+    for &(i, r) in &rp.rows {
+        let Some(entry) = v.replays.get(i) else { continue };
+        let sel = v.replay_focus && i == v.replay_sel;
+        if sel {
+            theme::fill(ui, white, r, PANEL_HI);
+            theme::fill(ui, white, [r[0], r[1], 2.0 * s, r[3]], ACCENT);
+        }
+        let pp = format!("{:.1} pp", entry.pp);
+        let pw = text.measure(&pp, 10.0 * s);
+        let nick = fit_face(
+            text,
+            Face::Body,
+            &entry.nick,
+            (r[2] - pw - 20.0 * s).max(24.0 * s),
+            11.0 * s,
+            0.0,
+        );
+        text.draw(&nick, r[0] + 10.0 * s, r[1] + 2.0 * s, 11.0 * s, if sel { INK_HI } else { INK }, ui);
+        text.draw(
+            &pp,
+            r[0] + r[2] - pw - 6.0 * s,
+            r[1] + 3.0 * s,
+            10.0 * s,
+            if sel { ACCENT_INK } else { INK_DIM },
+            ui,
+        );
+        let sub = fmt_score(entry.score, true);
+        let sub = fit_simple(text, &sub, r[2] - 20.0 * s, 8.5 * s);
+        text.draw(
+            &sub,
+            r[0] + 10.0 * s,
+            r[1] + 13.0 * s,
+            8.5 * s,
+            if sel { INK_DIM } else { INK_FAINT },
+            ui,
+        );
     }
 }
 
@@ -1256,6 +1386,27 @@ pub fn fit_face(text: &Text, face: Face, s: &str, max_w: f32, size: f32, trackin
 /// Обрезка строки основным шрифтом.
 pub fn fit_simple(text: &Text, s: &str, max_w: f32, size: f32) -> String {
     fit_face(text, Face::Body, s, max_w, size, 0.0)
+}
+
+/// `m:ss` для метки времени реплея.
+pub fn fmt_clock(t: f32) -> String {
+    let s = t.max(0.0).floor() as u32;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Маленькая метка режима просмотра: `REPLAY · nick` и время `t / конец`.
+/// Единственное, что отличает HUD реплея от обычной игры.
+pub fn draw_replay_badge(text: &Text, ui: &mut Vec<UiQuad>, nick: &str, t: f32, end: f32) {
+    let nick = fit_simple(text, nick, 360.0, 11.0);
+    text.draw(&format!("REPLAY · {nick}"), 24.0, 66.0, 11.0, INK_DIM, ui);
+    text.draw(
+        &format!("{} / {}", fmt_clock(t), fmt_clock(end)),
+        24.0,
+        81.0,
+        10.0,
+        INK_FAINT,
+        ui,
+    );
 }
 
 /// Всплывающее уведомление (сохранение реплея, обновление библиотеки).
