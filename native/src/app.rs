@@ -3846,7 +3846,13 @@ pub fn run() -> Result<()> {
     }
     let event_loop = builder.build()?;
     if std::env::var("DEEMO_BACKEND_ONLY").is_ok() {
-        let backend = if forced { "x11 (XWayland)" } else { "wayland/native" };
+        let backend = if cfg!(windows) {
+            "windows (winit)"
+        } else if forced {
+            "x11 (XWayland)"
+        } else {
+            "wayland/native"
+        };
         println!("backend: {backend}");
         return Ok(());
     }

@@ -1,11 +1,16 @@
 //! Deemo demo (native). Первый шаг: оффскрин-рендер сцены в PNG, чтобы сверять
 //! картинку с оригиналом.
 
+// Release-сборка под Windows — GUI-приложение: без этого за игрой висит
+// чёрная консоль. Весь stdout/stderr уходит в deemo.log рядом с exe.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod bg;
 mod chart;
 mod clock;
+mod hid_desc;
 mod library;
 mod map_offsets;
 mod math;
@@ -24,6 +29,8 @@ mod settings;
 mod settings_screen;
 mod stage;
 mod tablet;
+#[cfg(windows)]
+mod tablet_win;
 mod text;
 mod theme;
 mod ui;
@@ -1031,14 +1038,82 @@ fn queue_selftest() -> Result<()> {
     Ok(())
 }
 
+/// Windows release: GUI-подсистема не даёт консоли, а `println!`/паника на
+/// невалидном stdout могут уронить игру. Уводим оба стандартных потока в
+/// `deemo.log` рядом с exe. Для `--tablet-probe` дополнительно пробуем
+/// прицепиться к консоли cmd: сам probe пишет в `CONOUT$` отдельно, поэтому
+/// редирект stdout ему не мешает.
+#[cfg(all(windows, not(debug_assertions)))]
+fn init_release_logging(probe: bool) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    if probe {
+        // cmd/PowerShell: даём probe шанс увидеть консоль родителя.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+    let exe_log = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("deemo.log")));
+    let candidates: Vec<std::path::PathBuf> = exe_log
+        .into_iter()
+        .chain(std::iter::once(std::env::temp_dir().join("deemo.log")))
+        .collect();
+    let Some((path, file)) = candidates.into_iter().find_map(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok()
+            .map(|f| (path, f))
+    }) else {
+        return;
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+    // Хэндл должен жить весь процесс.
+    std::mem::forget(file);
+    println!(
+        "deemo: windows release, log {}",
+        path.display()
+    );
+    println!(
+        "deemo: cwd {}",
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|e| format!("<{e}>"))
+    );
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(all(windows, not(debug_assertions)))]
+    init_release_logging(args.iter().any(|a| a == "--tablet-probe"));
     let get = |name: &str| -> Option<String> {
         args.iter()
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+
+    // Диагностика планшетов: окно/GPU не нужны, лог пишется рядом с exe.
+    if let Some(i) = args.iter().position(|a| a == "--tablet-probe") {
+        let seconds = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(10.0)
+            .clamp(0.5, 120.0);
+        return tablet::probe(seconds);
+    }
 
     if args.iter().any(|a| a == "--settings-selftest") {
         return settings_selftest();

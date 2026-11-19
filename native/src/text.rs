@@ -512,6 +512,13 @@ const CJK_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    // Windows: системные CJK-шрифты (отсутствующие просто пропускаются)
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/msyhbd.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+    "C:/Windows/Fonts/msmincho.ttc",
 ];
 
 /// Подключить CJK-гарнитуру (если найдётся): без неё японские/китайские

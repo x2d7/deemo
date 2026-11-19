@@ -484,31 +484,43 @@ fn move_into(src: &Path, dst_dir: &Path, name: &str) -> Result<()> {
 
 // ===== диалог выбора файла (Wayland-совместимый путь) =====
 
-/// Выбрать пак через родной диалог: `kdialog`, при его отсутствии `zenity`.
+/// Выбрать пак через родной диалог. Linux/Wayland — `kdialog`/`zenity`;
+/// Windows — системный `IFileOpenDialog` через rfd (kdialog/zenity там нет).
 /// `None` — отмена, пустой ответ или нет ни одного диалога.
 pub fn pick_pack() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let dir = cwd.to_string_lossy().to_string();
-    match run_open_dialog(
-        "kdialog",
-        &["--title", PICK_TITLE, "--getopenfilename", &dir, "*.deemopack *.zip"],
-    ) {
-        Ok(picked) => picked,
-        Err(_) => run_open_dialog(
-            "zenity",
-            &[
-                "--file-selection",
-                &format!("--title={PICK_TITLE}"),
-                "--file-filter=.deemopack | *.deemopack *.zip",
-            ],
-        )
-        .ok()
-        .flatten(),
+    #[cfg(windows)]
+    {
+        return rfd::FileDialog::new()
+            .set_title(PICK_TITLE)
+            .add_filter("Deemo pack", &["deemopack", "zip"])
+            .pick_file();
+    }
+    #[cfg(not(windows))]
+    {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let dir = cwd.to_string_lossy().to_string();
+        match run_open_dialog(
+            "kdialog",
+            &["--title", PICK_TITLE, "--getopenfilename", &dir, "*.deemopack *.zip"],
+        ) {
+            Ok(picked) => picked,
+            Err(_) => run_open_dialog(
+                "zenity",
+                &[
+                    "--file-selection",
+                    &format!("--title={PICK_TITLE}"),
+                    "--file-filter=.deemopack | *.deemopack *.zip",
+                ],
+            )
+            .ok()
+            .flatten(),
+        }
     }
 }
 
 /// Запустить диалог. `Err` — программу не удалось запустить (тогда пробуем
 /// следующий диалог); `Ok(None)` — пользователь отменил.
+#[cfg_attr(windows, allow(dead_code))]
 fn run_open_dialog(cmd: &str, args: &[&str]) -> std::io::Result<Option<PathBuf>> {
     let out = std::process::Command::new(cmd)
         .args(args)
@@ -522,6 +534,7 @@ fn run_open_dialog(cmd: &str, args: &[&str]) -> std::io::Result<Option<PathBuf>>
 }
 
 /// Ответ диалога: первая непустая строка без пробелов по краям.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_dialog_stdout(bytes: &[u8]) -> Option<PathBuf> {
     let text = String::from_utf8_lossy(bytes);
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
