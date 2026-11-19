@@ -6,6 +6,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod assoc;
 mod audio;
 mod bg;
 mod chart;
@@ -20,6 +21,7 @@ mod pack;
 mod pack_download;
 mod pack_import;
 mod play;
+mod pp;
 mod render;
 mod replay;
 mod results;
@@ -28,6 +30,7 @@ mod screens;
 mod settings;
 mod settings_screen;
 mod stage;
+mod stars;
 mod tablet;
 #[cfg(windows)]
 mod tablet_win;
@@ -89,7 +92,7 @@ fn shot(
     let mut renderer = Renderer::new(gpu.device, gpu.queue, format)?;
 
     let chart = Chart::load(chart_path)?;
-    // --replay: заранее разобранный DMR1/DMR2 вместо синтетического autohit-плея
+    // --replay: заранее разобранный DMR1/DMR2/DMR3 вместо синтетического autohit-плея
     let blob = match replay_path {
         Some(path) => {
             let bytes = std::fs::read(path)
@@ -141,7 +144,7 @@ fn shot(
     let aspect = width as f32 / height as f32;
     renderer.set_camera(&scene.mvp(aspect));
     let mut sprites = scene.sprites(time, width, height);
-    // DMR2: точка курсора и кольцо нажатия — тот же код, что в игровом цикле
+    // DMR3: два луча курсора — тот же код, что в игровом цикле
     if let Some(d) = &driver {
         scene::push_replay_cursor(&mut sprites, d, time);
     }

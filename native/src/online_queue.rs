@@ -202,16 +202,17 @@ pub struct ScoreAck {
     pub record: bool,
     #[serde(default)]
     pub best: u64,
-    /// pp именно этой попытки и её сумма по аккаунту.
+    /// pp именно этой попытки (обязательное поле ответа).
     #[serde(default)]
     pub pp: f64,
+    /// Сумма по аккаунту и разбивка по рукам: `None` — поле отсутствовало
+    /// (старый сервер). UI покажет `—`, не 0.0.
     #[serde(default)]
-    pub total_pp: f64,
-    /// Разбивка по рукам (левая — перо/планшет, правая — мышь); в сумме = `pp`.
+    pub total_pp: Option<f64>,
     #[serde(default)]
-    pub pp_tablet: f64,
+    pub pp_tablet: Option<f64>,
     #[serde(default)]
-    pub pp_mouse: f64,
+    pub pp_mouse: Option<f64>,
 }
 
 impl ScoreAck {
@@ -224,9 +225,9 @@ impl ScoreAck {
             record: v["record"].as_bool().unwrap_or(false),
             best: v["best"].as_u64().unwrap_or(0),
             pp: v["pp"].as_f64().unwrap_or(0.0),
-            total_pp: v["total_pp"].as_f64().unwrap_or(0.0),
-            pp_tablet: v["pp_tablet"].as_f64().unwrap_or(0.0),
-            pp_mouse: v["pp_mouse"].as_f64().unwrap_or(0.0),
+            total_pp: v["total_pp"].as_f64(),
+            pp_tablet: v["pp_tablet"].as_f64(),
+            pp_mouse: v["pp_mouse"].as_f64(),
         })
     }
 }
@@ -674,8 +675,8 @@ mod tests {
         assert!(ack.record);
         assert_eq!(ack.best, 987_430);
         assert!((ack.pp - 172.6).abs() < 1e-9);
-        assert!((ack.total_pp - 2760.6).abs() < 1e-9);
-        assert!((ack.pp_tablet + ack.pp_mouse - ack.pp).abs() < 1e-9);
+        assert!((ack.total_pp.unwrap() - 2760.6).abs() < 1e-9);
+        assert!((ack.pp_tablet.unwrap() + ack.pp_mouse.unwrap() - ack.pp).abs() < 1e-9);
         // старый сервер (без pp) и не-JSON: загрузка успешна, показывать нечего
         assert!(ScoreAck::parse(r#"{"record":true,"best":9}"#).is_none());
         assert!(ScoreAck::parse("<html>ok</html>").is_none());
@@ -788,7 +789,7 @@ mod tests {
         assert_eq!(ev.acks[0].rec, entry);
         let ack = ev.acks[0].ack.as_ref().expect("ack");
         assert!((ack.pp - 172.6).abs() < 1e-9);
-        assert!((ack.total_pp - 2760.6).abs() < 1e-9);
+        assert!((ack.total_pp.unwrap() - 2760.6).abs() < 1e-9);
         let _ = handle.join();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -921,12 +922,12 @@ mod tests {
         let ack = uploaded.ack.as_ref().expect("server must return pp");
         println!("ack: {ack:?}");
         assert!(ack.pp > 0.0, "server must compute pp from the submitted hands");
-        assert!(ack.total_pp >= ack.pp);
+        assert!(ack.total_pp.unwrap() >= ack.pp);
         assert!(
-            (ack.pp_tablet + ack.pp_mouse - ack.pp).abs() < 0.05,
+            (ack.pp_tablet.unwrap() + ack.pp_mouse.unwrap() - ack.pp).abs() < 0.05,
             "per-hand pp must sum to pp"
         );
-        assert!((ack.pp_mouse - ack.pp_tablet).abs() > 0.0, "hands differ");
+        assert!((ack.pp_mouse.unwrap() - ack.pp_tablet.unwrap()).abs() > 0.0, "hands differ");
         assert!(ack.record, "first score of a fresh account is a record");
         // руки действительно дошли до сервера в формате {mouse, tablet}
         assert_eq!(sent["hands"]["mouse"]["perfect"], hands.mouse.perfect);

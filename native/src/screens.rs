@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 
-use crate::library::Song;
+use crate::library::{Entry, Song};
 use crate::online::{Online, OnlineRecord, ReplayEntry};
 use crate::render::UiQuad;
 use crate::results::{fmt_date, Results};
+use crate::stars::StarMap;
 use crate::text::{Face, Text};
 use crate::theme::{self, Btn, ACCENT, ACCENT_INK, COOL, GHOST, INK, INK_DIM, INK_FAINT, INK_HI, ON_INK, PANEL, PANEL_HI, RULE, RULE_STRONG};
 
@@ -129,10 +130,10 @@ pub fn lib_chrome(w: f32, _h: f32, geom: &LibGeom, selected: bool, logged_in: bo
 
 /// Позиции карточек/заголовков групп: `scroll` уже вычтен.
 pub fn library_rows(
-    groups: &[(String, Vec<usize>)],
+    groups: &[(String, Vec<Entry>)],
     geom: &LibGeom,
     scroll: f32,
-) -> (Vec<(usize, [f32; 4])>, Vec<(String, f32)>, f32) {
+) -> (Vec<(Entry, [f32; 4])>, Vec<(String, f32)>, f32) {
     let s = geom.s;
     let mut y = geom.top_h + 18.0 * s;
     let mut cards = Vec::new();
@@ -140,8 +141,8 @@ pub fn library_rows(
     for (name, idxs) in groups {
         heads.push((name.clone(), y - scroll));
         y += 30.0 * s;
-        for &si in idxs {
-            cards.push((si, [geom.rx, y - scroll, geom.rw, geom.row_h]));
+        for &e in idxs {
+            cards.push((e, [geom.rx, y - scroll, geom.rw, geom.row_h]));
             y += geom.row_h;
         }
         y += 20.0 * s;
@@ -159,40 +160,6 @@ pub struct Dropdown<'a> {
     pub items: &'a [DropdownItem<'a>],
 }
 
-/// Прямоугольники чипов сложности в нижней полосе.
-pub fn diff_chip_rects(
-    _w: f32,
-    h: f32,
-    geom: &LibGeom,
-    chrome: &LibChrome,
-    n: usize,
-) -> Vec<(usize, [f32; 4])> {
-    let s = geom.s;
-    let chip_w = 116.0 * s;
-    let gap = 10.0 * s;
-    let chip_h = 78.0 * s;
-    if n == 0 {
-        return Vec::new();
-    }
-    let total = n as f32 * chip_w + (n as f32 - 1.0) * gap;
-    let area_x = geom.margin + 500.0 * s;
-    let area_w = (chrome.play_btn[0] - 20.0 * s) - area_x;
-    let x0 = area_x + (area_w - total).max(0.0) * 0.5;
-    (0..n)
-        .map(|d| {
-            (
-                d,
-                [
-                    x0 + d as f32 * (chip_w + gap),
-                    h - geom.bot_h + 27.0 * s,
-                    chip_w,
-                    chip_h,
-                ],
-            )
-        })
-        .collect()
-}
-
 /// Всё, что нужно нарисовать выбор песни.
 pub struct LibraryView<'a> {
     pub geom: &'a LibGeom,
@@ -200,27 +167,29 @@ pub struct LibraryView<'a> {
     pub songs: &'a [Song],
     pub results: &'a Results,
     pub online: &'a Online,
-    pub cards: &'a [(usize, [f32; 4])],
+    /// кэш звёзд `song_id:diff` (пустой — подписи уровней)
+    pub stars: &'a StarMap,
+    pub cards: &'a [(Entry, [f32; 4])],
     pub headers: &'a [(String, f32)],
-    pub selected: Option<usize>,
-    pub diff: usize,
+    /// выбранная строка-чарт (песня + сложность)
+    pub selected: Option<Entry>,
     pub search: &'a str,
     pub sort_label: &'a str,
     pub group_label: &'a str,
     pub covers: &'a HashMap<usize, usize>,
     pub art: Option<usize>,
     /// песня под курсором (подсветка строки)
-    pub hover: Option<usize>,
+    pub hover: Option<Entry>,
     pub lb_online: bool,
     pub lb_pending: bool,
     pub lb_records: &'a [OnlineRecord],
-    /// публичные реплеи карты (топ-25); пусто — секции нет вовсе
-    pub replays: &'a [ReplayEntry],
-    /// выбранная строка списка реплеев и фокус клавиатуры на нём
-    pub replay_sel: usize,
-    pub replay_focus: bool,
-    pub hist_rects: &'a [(usize, [f32; 4])],
-    pub diff_rects: &'a [(usize, [f32; 4])],
+    /// выбранная строка лидерборда и фокус клавиатуры на нём
+    pub lb_sel: usize,
+    pub lb_focus: bool,
+    /// геометрия строк лидерборда (для отрисовки и кликов)
+    pub lb_rows: &'a [(usize, [f32; 4])],
+    /// строка под курсором (подсветка/подсказка pp · miss)
+    pub lb_hover: Option<usize>,
     pub dropdown: Option<Dropdown<'a>>,
     pub total_h: f32,
     pub scroll: f32,
@@ -290,15 +259,31 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
         // рамка-видоискатель
         theme::frame(ui, white, a, RULE, s);
         theme::corner_ticks(ui, white, a, [0.84, 0.80, 0.72, 0.55], 18.0 * s, s);
-        // уровень выбранной сложности на арте
-        if let Some(si) = v.selected {
-            let song = &v.songs[si];
-            let lv = song.levels.get(v.diff).cloned().unwrap_or_default();
+        // звезда выбранной сложности на арте
+        if let Some(e) = v.selected {
+            let song = &v.songs[e.song];
+            let star = crate::stars::star(v.stars, &song.id, song.chart_diff(e.diff));
             let chip = [a[0] + 18.0 * s, a[1] + 18.0 * s, 92.0 * s, 46.0 * s];
             theme::fill(ui, white, chip, [0.004, 0.004, 0.005, 0.72]);
             theme::frame(ui, white, chip, [0.84, 0.80, 0.72, 0.35], s);
-            theme::label(text, ui, "LV", chip[0] + 10.0 * s, chip[1] + 8.0 * s, 8.0 * s, 2.2 * s, INK_DIM);
-            text.draw_face(Face::Serif, &lv, chip[0] + 10.0 * s, chip[1] + 19.0 * s, 20.0 * s, INK_HI, ui);
+            match star {
+                Some(star) => {
+                    text.draw_face(
+                        Face::Serif,
+                        &crate::stars::label(star),
+                        chip[0] + 10.0 * s,
+                        chip[1] + 15.0 * s,
+                        20.0 * s,
+                        INK_HI,
+                        ui,
+                    );
+                }
+                None => {
+                    theme::label(text, ui, "LV", chip[0] + 10.0 * s, chip[1] + 8.0 * s, 8.0 * s, 2.2 * s, INK_DIM);
+                    let lv = song.chart_level(e.diff);
+                    text.draw_face(Face::Serif, lv, chip[0] + 10.0 * s, chip[1] + 19.0 * s, 20.0 * s, INK_HI, ui);
+                }
+            }
         }
     } else if real_notes.is_none() {
         // без арта — широкое поле для заголовка; когда падает настоящий чарт,
@@ -327,11 +312,7 @@ pub fn draw_library(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     );
 
     // === левая колонка: рекорды ===
-    // Реплеи прижаты к низу панели: история/лидерборд не рисуются ниже их
-    // верхней границы. Пустой список ничего не сдвигает и не рисует.
-    let rp = replays_layout(g, bottom_y, v.replays.len(), v.replay_sel);
-    draw_records(ctx, v, ui, rp.top);
-    draw_replays(ctx, v, ui, &rp);
+    draw_records(ctx, v, ui, bottom_y);
 
     // === титульный блок, когда песня не выбрана (main) ===
     if v.selected.is_none() {
@@ -441,7 +422,8 @@ fn draw_topbar(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     let _ = w;
 }
 
-fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32) {    let text = ctx.text;
+fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32) {
+    let text = ctx.text;
     let white = ctx.white;
     let s = ctx.s;
     let lw = v.geom.left_w;
@@ -470,44 +452,31 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
     theme::section(text, ui, white, "RECORDS", x, v.geom.top_h + 18.0 * s, rec_right, INK_DIM, s);
 
     let mut y = v.geom.top_h + 48.0 * s;
-    let Some(si) = v.selected else {
-        text.draw("Pick a song", x, y, 14.0 * s, INK_DIM, ui);
+    let Some(e) = v.selected else {
+        text.draw("Pick a chart", x, y, 14.0 * s, INK_DIM, ui);
         y += 22.0 * s;
         text.draw("from the list to see", x, y, 14.0 * s, INK_FAINT, ui);
         y += 18.0 * s;
         text.draw("its records.", x, y, 14.0 * s, INK_FAINT, ui);
         return;
     };
-    let song = &v.songs[si];
+    let song = &v.songs[e.song];
+    let chart = song.charts.get(e.diff);
     let title = fit_face(text, Face::Serif, &song.title, right - x, 17.0 * s, 0.2 * s);
     text.draw_face(Face::Serif, &title, x, y, 17.0 * s, INK_HI, ui);
     y += 24.0 * s;
     let comp = fit_simple(text, &song.composer, right - x, 11.0 * s);
     text.draw(&comp, x, y, 11.0 * s, INK_DIM, ui);
 
-    // табы сложностей
+    // шапка выбранного чарта: имя сложности + звезда (без чипов)
     y = v.geom.top_h + 108.0 * s;
-    theme::label(text, ui, "DIFFICULTY", x, y - 16.0 * s, 8.5 * s, 2.2 * s, INK_FAINT);
-    for &(d, r) in v.hist_rects {
-        let Some(chart) = song.charts.get(d) else {
-            continue;
-        };
-        let is_sel = d == v.diff;
-        let cap = diff_short(&chart.diff);
-        let tw = text.measure_tracked(Face::Serif, cap, 10.0 * s, 1.6 * s);
-        text.draw_tracked(
-            Face::Serif,
-            cap,
-            r[0] + (r[2] - tw) * 0.5,
-            r[1] + 6.0 * s,
-            10.0 * s,
-            1.6 * s,
-            if is_sel { INK_HI } else { INK_FAINT },
-            ui,
-        );
-        if is_sel {
-            theme::fill(ui, white, [r[0] + 4.0 * s, r[1] + r[3] - 2.0 * s, r[2] - 8.0 * s, 2.0 * s], ACCENT);
-        }
+    theme::label(text, ui, "CHART", x, y - 16.0 * s, 8.5 * s, 2.2 * s, INK_FAINT);
+    if let Some(chart) = chart {
+        let name = diff_name(&chart.diff);
+        text.draw_face(Face::Serif, name, x, y, 15.0 * s, INK_HI, ui);
+        let rating = crate::library::entry_rating_label(v.songs, e, v.stars);
+        let rw = text.measure_face(Face::Serif, &rating, 13.0 * s);
+        text.draw_face(Face::Serif, &rating, right - rw, y + 1.0 * s, 13.0 * s, ACCENT_INK, ui);
     }
 
     // тумблер локально/онлайн
@@ -525,10 +494,25 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
     let head = if is_online {
         "LEADERS".to_string()
     } else {
-        let diff_name = song.charts.get(v.diff).map(|c| c.diff.clone()).unwrap_or_default();
-        format!("HISTORY · {}", diff_short(&diff_name))
+        let diff_sh = chart.map(|c| diff_short(&c.diff)).unwrap_or("");
+        format!("HISTORY · {diff_sh}")
     };
     theme::section(text, ui, white, &head, x, y, right, INK_FAINT, s);
+    if is_online {
+        // подсказка клавиатуры справа в шапке, как у списка реплеев раньше
+        let hint = if v.lb_focus { "UP/DOWN · ENTER" } else { "TAB" };
+        let hw = text.measure_tracked(Face::Serif, hint, 8.0 * s, 1.0 * s);
+        text.draw_tracked(
+            Face::Serif,
+            hint,
+            (right - hw).max(x),
+            y + 2.0 * s,
+            8.0 * s,
+            1.0 * s,
+            if v.lb_focus { ACCENT_INK } else { INK_FAINT },
+            ui,
+        );
+    }
     y += 28.0 * s;
 
     if is_online {
@@ -541,22 +525,12 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
             text.draw("on the server.", x, y + 18.0 * s, 12.0 * s, INK_FAINT, ui);
             return;
         }
-        for (i, r) in v.lb_records.iter().enumerate() {
-            if y > bottom_y - 48.0 * s {
-                break;
-            }
-            draw_record_row(ctx, ui, y, x, right, &format!("{}", i + 1), &r.rank, r.score, r.accuracy, &r.nickname);
-            y += 44.0 * s;
-        }
+        draw_leader_rows(ctx, v, ui);
         return;
     }
 
     let sid = &song.id;
-    let diff_name = song
-        .charts
-        .get(v.diff)
-        .map(|c| c.diff.clone())
-        .unwrap_or_default();
+    let diff_name = chart.map(|c| c.diff.clone()).unwrap_or_default();
     if let Some(b) = v.results.best(sid, &diff_name) {
         let cap = format!("BEST {} · {:.2}%", b.rank, b.accuracy);
         text.draw_tracked(Face::Serif, &cap, x, y, 9.0 * s, 1.6 * s, ACCENT_INK, ui);
@@ -578,125 +552,86 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
     }
 }
 
-/// Компактный список реплеев в левой панели.
-///
-/// Четыре видимые строки — остальные доступны стрелками по фокусу (Tab):
-/// 25 записей не должны растягивать панель и выдавливать рекорды.
-pub const REPLAY_VISIBLE: usize = 4;
-
-pub struct ReplaysUi {
-    /// Верх секции; история/лидерборд заканчиваются выше.
-    pub top: f32,
-    pub rows: Vec<(usize, [f32; 4])>,
-    pub total: usize,
-}
-
-/// Геометрия секции REPLAYS — одна и та же для отрисовки и кликов.
-pub fn replays_layout(g: &LibGeom, bottom_y: f32, count: usize, sel: usize) -> ReplaysUi {
-    if count == 0 {
-        return ReplaysUi {
-            top: bottom_y,
-            rows: Vec::new(),
-            total: 0,
-        };
-    }
+/// Геометрия строк онлайн-лидерборда: одна формула для отрисовки и кликов.
+/// Начинается под заголовком `LEADERS` (см. [`draw_records`]).
+pub fn leaderboard_rows(g: &LibGeom, bottom_y: f32, count: usize) -> Vec<(usize, [f32; 4])> {
     let s = g.s;
-    let row_h = 24.0 * s;
-    let head_h = 18.0 * s;
-    let visible = count.min(REPLAY_VISIBLE);
-    let top = bottom_y - (head_h + visible as f32 * row_h + 4.0 * s);
-    // окно из visible строк всегда содержит выбранную
-    let first = (sel + 1).saturating_sub(visible).min(count - visible);
-    let rows = (0..visible)
-        .map(|k| {
+    let row_h = 46.0 * s;
+    let top = g.top_h + 210.0 * s;
+    let fit = (((bottom_y - 10.0 * s - top) / row_h).floor().max(0.0)) as usize;
+    (0..count.min(fit))
+        .map(|i| {
             (
-                first + k,
+                i,
                 [
                     g.margin,
-                    top + head_h + 2.0 * s + k as f32 * row_h,
+                    top + i as f32 * row_h,
                     g.left_w - g.margin * 2.0,
-                    row_h - 2.0 * s,
+                    row_h,
                 ],
             )
         })
-        .collect();
-    ReplaysUi {
-        top,
-        rows,
-        total: count,
-    }
+        .collect()
 }
 
-fn draw_replays(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, rp: &ReplaysUi) {
-    if v.replays.is_empty() {
-        return;
-    }
+/// Строка лидерборда: ранг, ник, счёт, настоящая точность, промахи и pp.
+/// Маленький ▶ справа — приглашение открыть детали плея.
+fn draw_leader_rows(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     let text = ctx.text;
     let white = ctx.white;
     let s = ctx.s;
-    let x = v.geom.margin;
-    let right = v.geom.left_w - v.geom.margin;
-    let head = if rp.total > rp.rows.len() {
-        format!("REPLAYS · {}", rp.total)
-    } else {
-        "REPLAYS".to_string()
-    };
-    // подсказка клавиатуры в правом краю заголовка (как «ENTER» у кнопок)
-    let hint = if v.replay_focus { "UP/DOWN · ENTER" } else { "TAB" };
-    let hw = text.measure_tracked(Face::Serif, hint, 8.0 * s, 1.0 * s);
-    let head_col = if v.replay_focus { ACCENT_INK } else { INK_FAINT };
-    theme::label(text, ui, &head, x, rp.top, 11.0 * s, 2.6 * s, head_col);
-    let head_w = text.measure_tracked(Face::Serif, &head, 11.0 * s, 2.6 * s);
-    let rule_x = x + head_w + 14.0 * s;
-    let rule_w = (right - hw - 10.0 * s - rule_x).max(0.0);
-    theme::hair_h(ui, white, rule_x, rp.top + 7.0 * s, rule_w, RULE, s);
-    text.draw_tracked(
-        Face::Serif,
-        hint,
-        (right - hw).max(x),
-        rp.top + 2.0 * s,
-        8.0 * s,
-        1.0 * s,
-        if v.replay_focus { INK_DIM } else { INK_FAINT },
-        ui,
-    );
-
-    for &(i, r) in &rp.rows {
-        let Some(entry) = v.replays.get(i) else { continue };
-        let sel = v.replay_focus && i == v.replay_sel;
-        if sel {
+    for &(i, r) in v.lb_rows {
+        let Some(rec) = v.lb_records.get(i) else { continue };
+        let selected = v.lb_focus && i == v.lb_sel;
+        let hover = v.lb_hover == Some(i);
+        if selected || hover {
             theme::fill(ui, white, r, PANEL_HI);
-            theme::fill(ui, white, [r[0], r[1], 2.0 * s, r[3]], ACCENT);
+            if selected {
+                theme::fill(ui, white, [r[0], r[1], 2.0 * s, r[3]], ACCENT);
+            }
         }
-        let pp = format!("{:.1} pp", entry.pp);
-        let pw = text.measure(&pp, 10.0 * s);
+        let x = r[0];
+        let right = r[0] + r[2];
+        let content_right = right - 24.0 * s;
+        let rc = theme::rank_color(&rec.rank);
+        text.draw_face(Face::Serif, &rec.rank, x + 8.0 * s, r[1] + 6.0 * s, 16.0 * s, rc, ui);
         let nick = fit_face(
             text,
             Face::Body,
-            &entry.nick,
-            (r[2] - pw - 20.0 * s).max(24.0 * s),
-            11.0 * s,
+            &rec.nickname,
+            (content_right - (x + 42.0 * s) - 100.0 * s).max(30.0 * s),
+            12.0 * s,
             0.0,
         );
-        text.draw(&nick, r[0] + 10.0 * s, r[1] + 2.0 * s, 11.0 * s, if sel { INK_HI } else { INK }, ui);
-        text.draw(
-            &pp,
-            r[0] + r[2] - pw - 6.0 * s,
-            r[1] + 3.0 * s,
-            10.0 * s,
-            if sel { ACCENT_INK } else { INK_DIM },
-            ui,
+        text.draw(&nick, x + 42.0 * s, r[1] + 5.0 * s, 12.0 * s, if selected || hover { INK_HI } else { INK }, ui);
+        let score = fmt_score(rec.score, true);
+        let sw = text.measure(&score, 11.0 * s);
+        text.draw(&score, content_right - sw, r[1] + 6.0 * s, 11.0 * s, INK, ui);
+
+        // вторая строка: промахи/комбо слева, точность попаданий и pp справа
+        let sub = format!("{} MISS · {}x", rec.miss, rec.max_combo);
+        let sub = fit_simple(text, &sub, r[2] * 0.45, 8.5 * s);
+        text.draw(&sub, x + 42.0 * s, r[1] + 24.0 * s, 8.5 * s, INK_FAINT, ui);
+        let acc_pp = format!(
+            "{:.2}% · {}",
+            rec.hit_accuracy(),
+            crate::pp::tag(rec.pp)
         );
-        let sub = fmt_score(entry.score, true);
-        let sub = fit_simple(text, &sub, r[2] - 20.0 * s, 8.5 * s);
-        text.draw(
-            &sub,
-            r[0] + 10.0 * s,
-            r[1] + 13.0 * s,
-            8.5 * s,
-            if sel { INK_DIM } else { INK_FAINT },
+        let apw = text.measure(&acc_pp, 9.0 * s);
+        let ap_x = (content_right - apw).max(x + 42.0 * s + 80.0 * s);
+        let ap_col = if selected || hover { ACCENT_INK } else { INK_DIM };
+        text.draw(&acc_pp, ap_x, r[1] + 24.0 * s, 9.0 * s, ap_col, ui);
+
+        // ▶ — открыть детали (мышью или Enter по выбранной строке)
+        theme::play_glyph(
             ui,
+            white,
+            right - 15.0 * s,
+            r[1] + (r[3] - 9.0 * s) * 0.5,
+            9.0 * s,
+            if selected || hover { ACCENT_INK } else { [0.84, 0.80, 0.72, 0.30] },
         );
+        theme::hair_h(ui, white, x, r[1] + r[3] - theme::hairline(s), r[2], [0.84, 0.80, 0.72, 0.06], s);
     }
 }
 
@@ -749,14 +684,15 @@ fn draw_song_list(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f3
         text.draw_tracked(Face::Serif, &up, g.rx + 16.0 * s, *y + 1.0 * s, 10.0 * s, 2.4 * s, INK_DIM, ui);
     }
 
-    // строки
-    for &(si, r) in v.cards {
+    // строки: одна строка = один чарт (песня + сложность)
+    for &(e, r) in v.cards {
         if r[1] < g.top_h || r[1] + r[3] > bottom_y {
             continue;
         }
-        let song = &v.songs[si];
-        let is_sel = v.selected == Some(si);
-        let is_hover = v.hover == Some(si);
+        let Some(song) = v.songs.get(e.song) else { continue };
+        let Some(chart) = song.charts.get(e.diff) else { continue };
+        let is_sel = v.selected == Some(e);
+        let is_hover = v.hover == Some(e);
         if is_sel {
             theme::fill(ui, white, r, PANEL_HI);
             theme::fill(ui, white, [r[0], r[1], 2.0 * s, r[3]], ACCENT);
@@ -768,7 +704,7 @@ fn draw_song_list(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f3
         // обложка
         let tsize = 56.0 * s;
         let tr = [r[0] + 6.0 * s, r[1] + (r[3] - tsize) * 0.5, tsize, tsize];
-        if let Some(&handle) = v.covers.get(&si) {
+        if let Some(&handle) = v.covers.get(&e.song) {
             ui.push(UiQuad {
                 tex: handle,
                 rect: tr,
@@ -785,18 +721,42 @@ fn draw_song_list(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f3
         let right_pad = 116.0 * s;
         let title = fit_face(text, Face::Body, &song.title, r[2] - (tx - r[0]) - right_pad, 17.0 * s, 0.0);
         let title_col = if is_sel || is_hover { INK_HI } else { INK };
-        text.draw(&title, tx, r[1] + 17.0 * s, 17.0 * s, title_col, ui);
-        let comp = fit_simple(text, &song.composer, r[2] - (tx - r[0]) - right_pad, 11.0 * s);
-        text.draw(&comp, tx, r[1] + 41.0 * s, 11.0 * s, if is_sel { INK_DIM } else { INK_FAINT }, ui);
+        text.draw(&title, tx, r[1] + 15.0 * s, 17.0 * s, title_col, ui);
+
+        // имя сложности — отдельной строкой, до метаданных (osu!-стиль)
+        let diff_cap = diff_name(&chart.diff);
+        text.draw_tracked(
+            Face::Serif,
+            diff_cap,
+            tx,
+            r[1] + 38.0 * s,
+            9.5 * s,
+            2.0 * s,
+            if is_sel { ACCENT_INK } else { INK_DIM },
+            ui,
+        );
+        let comp_w = r[2] - (tx - r[0]) - right_pad
+            - text.measure_tracked(Face::Serif, diff_cap, 9.5 * s, 2.0 * s)
+            - 14.0 * s;
+        let comp = fit_simple(text, &song.composer, comp_w.max(20.0 * s), 10.5 * s);
+        text.draw(
+            &comp,
+            tx + text.measure_tracked(Face::Serif, diff_cap, 9.5 * s, 2.0 * s) + 14.0 * s,
+            r[1] + 38.0 * s,
+            10.5 * s,
+            if is_sel { INK_DIM } else { INK_FAINT },
+            ui,
+        );
 
         let mins = (song.duration / 60.0).floor() as u32;
         let secs = (song.duration % 60.0) as u32;
-        let info = format!("{} · {}:{:02} · {}", song.album, mins, secs, song.levels.join("/"));
+        let rating = crate::library::entry_rating_label(v.songs, e, v.stars);
+        let info = format!("{rating} · {} · {}:{:02}", song.album, mins, secs);
         let info = fit_simple(text, &info, r[2] - (tx - r[0]) - right_pad, 9.5 * s);
-        text.draw(&info, tx, r[1] + 59.0 * s, 9.5 * s, [0.84, 0.80, 0.72, 0.26], ui);
+        text.draw(&info, tx, r[1] + 58.0 * s, 9.5 * s, if is_sel { INK_DIM } else { [0.84, 0.80, 0.72, 0.30] }, ui);
 
-        // справа: ранг / точность / счёт
-        if let Some(best) = v.results.best_song(&song.id) {
+        // справа: лучший результат именно этой сложности
+        if let Some(best) = v.results.best(&song.id, &chart.diff) {
             let rc = theme::rank_color(&best.rank);
             let rw = text.measure_face(Face::Display, &best.rank, 26.0 * s);
             text.draw_face(Face::Display, &best.rank, r[0] + r[2] - 18.0 * s - rw, r[1] + 18.0 * s, 26.0 * s, rc, ui);
@@ -845,10 +805,10 @@ fn draw_bottom(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, by: f32, w: f32
     theme::fill(ui, white, [0.0, by, w, h - by], [0.006, 0.006, 0.0075, 0.94]);
     theme::hair_h(ui, white, 0.0, by, w, RULE_STRONG, s);
 
-    let Some(si) = v.selected else {
+    let Some(e) = v.selected else {
         // главный экран без выбора: подсказки + статистика библиотеки
         text.draw_tracked(Face::Serif, "SONG SELECT", MARGIN * s, by + 22.0 * s, 9.0 * s, 3.0 * s, INK_FAINT, ui);
-        text.draw("Click — select a song and preview", MARGIN * s, by + 44.0 * s, 14.0 * s, INK_HI, ui);
+        text.draw("Click — select a chart and preview", MARGIN * s, by + 44.0 * s, 14.0 * s, INK_HI, ui);
         text.draw("Type — search title, artist, album", MARGIN * s, by + 68.0 * s, 10.5 * s, INK_DIM, ui);
         text.draw("F7 — install a pack", MARGIN * s, by + 90.0 * s, 10.5 * s, INK_FAINT, ui);
         let stats = [
@@ -868,9 +828,19 @@ fn draw_bottom(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, by: f32, w: f32
         return;
     };
 
-    let song = &v.songs[si];
+    let Some(song) = v.songs.get(e.song) else { return };
+    let Some(chart) = song.charts.get(e.diff) else { return };
+    // шапка выбранного чарта: имя сложности + звезда (чипов больше нет)
     theme::fill(ui, white, [MARGIN * s, by + 21.0 * s, 5.0 * s, 5.0 * s], ACCENT);
-    text.draw_tracked(Face::Serif, "SELECTED", MARGIN * s + 12.0 * s, by + 17.0 * s, 9.0 * s, 2.6 * s, INK_DIM, ui);
+    let sel_cap = format!("SELECTED · {}", diff_name(&chart.diff));
+    text.draw_tracked(Face::Serif, &sel_cap, MARGIN * s + 12.0 * s, by + 17.0 * s, 9.0 * s, 2.6 * s, INK_DIM, ui);
+    let cap_w = text.measure_tracked(Face::Serif, &sel_cap, 9.0 * s, 2.6 * s);
+    let star = crate::stars::star(v.stars, &song.id, &chart.diff);
+    let rating = match star {
+        Some(star) => crate::stars::label(star),
+        None => format!("LV {}", song.chart_level(e.diff)),
+    };
+    text.draw_face(Face::Serif, &rating, MARGIN * s + 24.0 * s + cap_w, by + 14.0 * s, 12.0 * s, ACCENT_INK, ui);
     let title = fit_face(text, Face::Display, &song.title, 460.0 * s, 30.0 * s, 0.0);
     text.draw_face(Face::Display, &title, MARGIN * s - 2.0 * s, by + 30.0 * s, 30.0 * s, INK_HI, ui);
     let comp = fit_simple(text, &song.composer, 420.0 * s, 11.0 * s);
@@ -881,37 +851,23 @@ fn draw_bottom(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, by: f32, w: f32
     let meta = fit_simple(text, &meta, 420.0 * s, 9.5 * s);
     text.draw(&meta, MARGIN * s, by + 92.0 * s, 9.5 * s, INK_FAINT, ui);
 
-    // чипы сложностей
-    let cs = v.chrome;
-    let n = v.diff_rects.len();
-    if n > 0 {
-        for &(d, r) in v.diff_rects {
-            let Some(chart) = song.charts.get(d) else {
-                continue;
-            };
-            let is_sel = d == v.diff;
-            if is_sel {
-                theme::fill(ui, white, r, INK);
-            } else {
-                theme::fill(ui, white, r, PANEL);
-                theme::frame(ui, white, r, [0.84, 0.80, 0.72, 0.20], s);
-            }
-            let (fg, fg_dim) = if is_sel {
-                (ON_INK, [ON_INK[0], ON_INK[1], ON_INK[2], 0.55])
-            } else {
-                (INK_HI, INK_FAINT)
-            };
-            let cap = diff_short(&chart.diff);
-            text.draw_centered_tracked(Face::Serif, cap, r[0] + r[2] * 0.5, r[1] + 10.0 * s, 8.5 * s, 2.2 * s, if is_sel { fg_dim } else { INK_DIM }, ui);
-            let lv = song.levels.get(d).cloned().unwrap_or_default();
-            text.draw_centered_face(Face::Serif, &lv, r[0] + r[2] * 0.5, r[1] + 26.0 * s, 26.0 * s, fg, ui);
-            if let Some(b) = v.results.best(&song.id, &chart.diff) {
-                text.draw_centered_face(Face::Body, &format!("{} {:.1}%", b.rank, b.accuracy), r[0] + r[2] * 0.5, r[1] + 58.0 * s, 9.0 * s, if is_sel { fg_dim } else { INK_FAINT }, ui);
-            }
+    // на месте прежних чипов — лучший результат именно этого чарта
+    let bx = MARGIN * s + 500.0 * s;
+    theme::label(text, ui, "BEST ON THIS CHART", bx, by + 28.0 * s, 8.5 * s, 2.2 * s, INK_FAINT);
+    match v.results.best(&song.id, &chart.diff) {
+        Some(b) => {
+            let rc = theme::rank_color(&b.rank);
+            text.draw_face(Face::Serif, &b.rank, bx, by + 44.0 * s, 30.0 * s, rc, ui);
+            text.draw_face(Face::Body, &format!("{:.2}%", b.accuracy), bx + 58.0 * s, by + 46.0 * s, 16.0 * s, INK, ui);
+            text.draw(&fmt_score_local(b.score, false), bx + 58.0 * s, by + 68.0 * s, 10.0 * s, INK_FAINT, ui);
+        }
+        None => {
+            text.draw("Not played yet", bx, by + 48.0 * s, 13.0 * s, INK_FAINT, ui);
         }
     }
 
     // PLAY
+    let cs = v.chrome;
     let pb = cs.play_btn;
     theme::fill(ui, white, pb, INK);
     theme::play_glyph(ui, white, pb[0] + 22.0 * s, pb[1] + (pb[3] - 13.0 * s) * 0.5, 13.0 * s, ON_INK);
@@ -1025,29 +981,27 @@ pub enum ResultPp {
     /// Сервер посчитал pp этой попытки.
     Ready {
         pp: f64,
-        total_pp: f64,
-        pp_tablet: f64,
-        pp_mouse: f64,
+        /// None — поле отсутствовало в ответе сервера (покажем `—`).
+        total_pp: Option<f64>,
+        pp_tablet: Option<f64>,
+        pp_mouse: Option<f64>,
         record: bool,
     },
 }
 
 /// Одна маленькая строка под статистикой; `None` — строку не рисовать.
-/// `PP +172.6  ·  TOTAL 2760.6  ·  PEN 86.0 / MOUSE 86.6`
+/// Форматирование (и единственное место, где pp становится строкой) —
+/// [`crate::pp::result_line`].
 pub fn pp_line(pp: ResultPp) -> Option<String> {
-    match pp {
-        ResultPp::Hidden => None,
-        ResultPp::Pending => Some("PP PENDING".to_string()),
-        ResultPp::Ready { pp, total_pp, pp_tablet, pp_mouse, .. } => Some(format!(
-            "PP {pp:+.1}  ·  TOTAL {total_pp:.1}  ·  PEN {pp_tablet:.1} / MOUSE {pp_mouse:.1}"
-        )),
-    }
+    crate::pp::result_line(pp)
 }
 
 pub struct ResultView<'a> {
     pub song_title: &'a str,
     pub artist: &'a str,
     pub diff: &'a str,
+    /// звезда сложности из кэша сервера; None — звёзд ещё нет (оффлайн).
+    pub star: Option<f32>,
     pub play: &'a crate::play::Play,
     pub rank: &'a str,
     pub is_record: bool,
@@ -1092,7 +1046,10 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
     text.draw_centered_tracked(Face::Serif, "RESULT", cx, y(12.0), z(8.5), 4.0 * k, INK_DIM, ui);
     let title = fit_face(text, Face::Display, v.song_title, w - 240.0 * k, z(34.0), 0.0);
     text.draw_centered_face(Face::Display, &title, cx, y(46.0), z(34.0), INK_HI, ui);
-    let sub = format!("{} · {}", v.artist, diff_short(v.diff));
+    let sub = match v.star {
+        Some(star) => format!("{} · {} · {}", v.artist, diff_short(v.diff), crate::stars::label(star)),
+        None => format!("{} · {}", v.artist, diff_short(v.diff)),
+    };
     let sub = fit_simple(text, &sub, w - 240.0 * k, z(10.0));
     text.draw_centered_tracked(Face::Serif, &sub, cx, y(88.0), z(10.0), 2.6 * k, INK_DIM, ui);
 
@@ -1258,6 +1215,156 @@ fn draw_histogram(
     text.draw_centered("+200", x0 + hw - 14.0 * k, y0 + hh + 6.0 * k, 9.0 * k, INK_FAINT, ui);
 }
 
+// ===== детали плея из лидерборда =====
+
+/// Один онлайн-рекорд с публичным реплеем (если он есть у этого ника).
+pub struct PlayDetailView<'a> {
+    pub song_title: &'a str,
+    pub artist: &'a str,
+    pub diff: &'a str,
+    pub star: Option<f32>,
+    pub record: &'a OnlineRecord,
+    /// Публичный реплей этого ника на ту же карту (None — смотреть нечего).
+    pub replay: Option<&'a ReplayEntry>,
+    /// Можно ли запустить просмотр (ник есть и реплей нашёлся).
+    pub can_watch: bool,
+    /// Короткая причина, почему просмотр недоступен.
+    pub reason: &'a str,
+}
+
+pub struct PlayDetailUi {
+    /// Кнопка «СМОТРЕТЬ РЕПЛЕЙ» (главное действие, Enter).
+    pub watch_btn: [f32; 4],
+    /// Крестик/надпись «ЗАКРЫТЬ» в правом верхнем углу.
+    pub close_btn: [f32; 4],
+}
+
+/// Экран деталей плея: та же типографика и сетка, что у результата, но без
+/// глобального хрома библиотеки. Рисуется поверх неё.
+pub fn draw_play_detail(ctx: &Ctx, v: &PlayDetailView, ui: &mut Vec<UiQuad>) -> PlayDetailUi {
+    let text = ctx.text;
+    let white = ctx.white;
+    let (w, h) = (ctx.w, ctx.h);
+    let cx = w * 0.5;
+    let (k, oy) = result_scale(w, h);
+    let y = |v: f32| oy + v * k;
+    let z = |v: f32| v * k;
+    let rec = v.record;
+
+    theme::fill(ui, white, [0.0, 0.0, w, h], theme::BG);
+    theme::hair_h(ui, white, MARGIN * k, y(34.0), w - MARGIN * k * 2.0, RULE, k);
+    theme::hair_h(ui, white, MARGIN * k, h - y(34.0), w - MARGIN * k * 2.0, RULE, k);
+    theme::hair_v(ui, white, cx, y(138.0), z(138.0), RULE, k);
+
+    // шапка
+    text.draw_centered_tracked(Face::Serif, "PLAY DETAIL", cx, y(12.0), z(8.5), 4.0 * k, INK_DIM, ui);
+    let title = fit_face(text, Face::Display, v.song_title, w - 240.0 * k, z(34.0), 0.0);
+    text.draw_centered_face(Face::Display, &title, cx, y(46.0), z(34.0), INK_HI, ui);
+    let star = v.star.map(crate::stars::label).unwrap_or_default();
+    let mut sub = format!("{} · {} · {}", rec.nickname, v.artist, diff_short(v.diff));
+    if !star.is_empty() {
+        sub.push_str(" · ");
+        sub.push_str(&star);
+    }
+    let sub = fit_simple(text, &sub, w - 240.0 * k, z(10.0));
+    text.draw_centered_tracked(Face::Serif, &sub, cx, y(88.0), z(10.0), 2.6 * k, INK_DIM, ui);
+
+    // закрыть: единственная вторая кнопка экрана
+    let close_cap = "ЗАКРЫТЬ";
+    let cw = text.measure(close_cap, z(10.0));
+    let close_rect = [w - MARGIN * k - cw - 10.0 * k, y(8.0), cw + 10.0 * k, z(22.0)];
+    text.draw(close_cap, close_rect[0] + 5.0 * k, close_rect[1] + 3.0 * k, z(10.0), INK_FAINT, ui);
+    theme::hair_h(ui, white, close_rect[0] + 5.0 * k, close_rect[1] + z(18.0), cw, RULE, k);
+
+    // ранг слева
+    let rank_col = theme::rank_color(&rec.rank);
+    let rank_x = cx - 260.0 * k;
+    text.draw_centered_face(Face::Display, &rec.rank, rank_x, y(146.0), z(118.0), rank_col, ui);
+    theme::label(text, ui, "RANK", rank_x - 18.0 * k, y(278.0), z(9.0), 3.0 * k, INK_DIM);
+
+    // счёт и настоящая точность попаданий справа
+    let sr = cx + 300.0 * k;
+    let score = fmt_score(rec.score, true);
+    let sw = text.measure_face(Face::Display, &score, z(52.0));
+    text.draw_face(Face::Display, &score, sr - sw, y(136.0), z(52.0), INK_HI, ui);
+    let score_l = "SCORE";
+    let slw = text.measure_tracked(Face::Serif, score_l, z(8.5), 3.0 * k);
+    text.draw_tracked(Face::Serif, score_l, sr - slw, y(118.0), z(8.5), 3.0 * k, INK_FAINT, ui);
+    let acc = format!("{:.2}%", rec.hit_accuracy());
+    let aw = text.measure_face(Face::Serif, &acc, z(26.0));
+    text.draw_face(Face::Serif, &acc, sr - aw, y(200.0), z(26.0), INK, ui);
+    let acc_l = "ACCURACY";
+    let alw = text.measure_tracked(Face::Serif, acc_l, z(9.0), 2.2 * k);
+    text.draw_tracked(Face::Serif, acc_l, sr - alw, y(236.0), z(9.0), 2.2 * k, INK_DIM, ui);
+
+    // статистика: 4 колонки, как на результате
+    let counts = [
+        ("PERFECT", format!("{}", rec.perfect)),
+        ("GOOD", format!("{}", rec.good)),
+        ("MISS", format!("{}", rec.miss)),
+        ("MAX COMBO", format!("{}", rec.max_combo)),
+    ];
+    let cw4 = (w - MARGIN * k * 2.0) / counts.len() as f32;
+    for (i, (cap, val)) in counts.iter().enumerate() {
+        let x0 = MARGIN * k + cw4 * i as f32;
+        let xc = x0 + cw4 * 0.5;
+        let col = match i {
+            0 => ACCENT_INK,
+            2 => [0.86, 0.42, 0.34, 1.0],
+            _ => INK_HI,
+        };
+        text.draw_centered_face(Face::Serif, val, xc, y(300.0), z(30.0), col, ui);
+        text.draw_centered_tracked(Face::Serif, cap, xc, y(338.0), z(9.0), 2.6 * k, INK_DIM, ui);
+        if i > 0 {
+            theme::hair_v(ui, white, x0, y(304.0), z(44.0), RULE, k);
+        }
+    }
+
+    // pp — ровно серверное поле записи (см. crate::pp); реплей-запись может
+    // дать только запасную подпись, если у записи pp нет вовсе
+    let pp_line = crate::pp::detail_line(rec);
+    text.draw_centered_tracked(Face::Serif, &pp_line, cx, y(354.0), z(10.0), 2.2 * k, ACCENT_INK, ui);
+    if let Some(note) = crate::pp::replay_pp_note(rec, v.replay) {
+        text.draw_centered_tracked(Face::Serif, &note, cx, y(368.0), z(9.0), 1.8 * k, INK_FAINT, ui);
+    }
+    // дата и скорость
+    let ts = if rec.timestamp > 0 {
+        rec.timestamp
+    } else {
+        v.replay.map(|r| r.timestamp).unwrap_or(0)
+    };
+    let date_speed = if rec.speed > 0.0 {
+        format!("{} · SPEED {:.1}", fmt_date(ts), rec.speed)
+    } else {
+        fmt_date(ts)
+    };
+    text.draw_centered_tracked(Face::Serif, &date_speed, cx, y(378.0), z(9.5), 2.0 * k, INK_FAINT, ui);
+
+    // главное действие — просмотр реплея
+    let watch_btn = result_layout(w, h).apply_btn;
+    if v.can_watch {
+        theme::fill(ui, white, watch_btn, PANEL);
+        theme::frame(ui, white, watch_btn, [0.69, 0.44, 0.12, 0.72], k);
+        theme::corner_ticks(ui, white, watch_btn, ACCENT, 12.0 * k, k);
+        text.draw_centered("СМОТРЕТЬ РЕПЛЕЙ", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_HI, ui);
+    } else {
+        theme::fill(ui, white, watch_btn, [0.84, 0.80, 0.72, 0.02]);
+        theme::frame(ui, white, watch_btn, RULE, k);
+        text.draw_centered("СМОТРЕТЬ РЕПЛЕЙ", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_FAINT, ui);
+        let reason = fit_simple(text, v.reason, watch_btn[2], z(10.0));
+        text.draw_centered(&reason, cx, watch_btn[1] + watch_btn[3] + z(14.0), z(10.0), INK_FAINT, ui);
+    }
+
+    let hint = if v.can_watch {
+        "ESC / BACKSPACE — ЗАКРЫТЬ · ENTER — СМОТРЕТЬ"
+    } else {
+        "ESC / BACKSPACE — ЗАКРЫТЬ"
+    };
+    text.draw_centered(hint, cx, h - oy - 56.0 * k, z(9.5), INK_FAINT, ui);
+
+    PlayDetailUi { watch_btn, close_btn: close_rect }
+}
+
 // ===== вход =====
 
 pub struct LoginView<'a> {
@@ -1341,6 +1448,18 @@ pub fn diff_short(d: &str) -> &'static str {
         "hard" => "HARD",
         "extra" => "EXTRA",
         "expert" => "EXP",
+        _ => "?",
+    }
+}
+
+/// Полное имя сложности для строки списка и шапки чарта.
+pub fn diff_name(d: &str) -> &'static str {
+    match d {
+        "easy" => "EASY",
+        "normal" => "NORMAL",
+        "hard" => "HARD",
+        "extra" => "EXTRA",
+        "expert" => "EXPERT",
         _ => "?",
     }
 }

@@ -158,23 +158,6 @@ impl Results {
         self.map.get(&Self::key(song, diff))
     }
 
-    /// Лучший результат песни среди всех сложностей.
-    pub fn best_song(&self, song: &str) -> Option<&SongResult> {
-        self.map
-            .iter()
-            .filter(|(k, _)| k.starts_with(&format!("{song}:")))
-            .map(|(_, v)| v)
-            .max_by_key(|r| r.score)
-    }
-
-    /// История плеев песни (свежие первыми), не более limit.
-    pub fn history_for(&self, song: &str, limit: usize) -> Vec<&PlayRecord> {
-        let mut v: Vec<&PlayRecord> = self.history.iter().filter(|r| r.song == song).collect();
-        v.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        v.truncate(limit);
-        v
-    }
-
     /// История плеев песни по конкретной сложности (свежие первыми).
     pub fn history_for_diff(&self, song: &str, diff: &str, limit: usize) -> Vec<&PlayRecord> {
         let mut v: Vec<&PlayRecord> = self

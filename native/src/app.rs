@@ -13,7 +13,7 @@ use winit::window::{Window, WindowId};
 use crate::audio::MusicPlayer;
 use crate::chart::Chart;
 use crate::clock::Clock;
-use crate::library::{self, Song};
+use crate::library::{self, Entry, Song};
 use crate::play::{Judge, Play};
 use crate::render::{Renderer, ScreenQuad, UiQuad};
 use crate::scene::Scene;
@@ -39,9 +39,8 @@ struct Gfx {
 enum Mode {
     Library {
         scroll: f32,
-        selected: Option<usize>,
-        /// выбранная сложность (для фильтра истории и запуска)
-        diff: usize,
+        /// выбранный чарт (песня + сложность); список плоский, osu!-стиль
+        selected: Option<Entry>,
     },
     Play {
         song: usize,
@@ -67,6 +66,44 @@ enum Mode {
         register: bool,
         error: Option<String>,
     },
+}
+
+/// Открытые детали одного онлайнового плея (снимок на момент клика/Enter):
+/// лидерборд в фоне мог обновиться, но экран не должен моргать.
+#[derive(Clone)]
+pub struct PlayDetail {
+    pub record: crate::online::OnlineRecord,
+    pub replay: Option<crate::online::ReplayEntry>,
+    pub star: Option<f32>,
+}
+
+impl PlayDetail {
+    pub fn can_watch(&self) -> bool {
+        !self.record.nickname.trim().is_empty() && self.replay.is_some()
+    }
+
+    /// Короткая причина, почему «СМОТРЕТЬ РЕПЛЕЙ» выключена.
+    pub fn watch_reason(&self) -> &'static str {
+        if self.record.nickname.trim().is_empty() {
+            "У записи нет ника — реплей не найти"
+        } else {
+            "Реплея этого игрока на сервере нет"
+        }
+    }
+}
+
+/// Запись в списке лидерборда, у которой нашёлся публичный реплей.
+pub fn detail_for_record(
+    rec: &crate::online::OnlineRecord,
+    replays: &[crate::online::ReplayEntry],
+    star: Option<f32>,
+) -> PlayDetail {
+    let nick = rec.nickname.trim();
+    let replay = replays
+        .iter()
+        .find(|r| !nick.is_empty() && r.nick.trim() == nick)
+        .cloned();
+    PlayDetail { record: rec.clone(), replay, star }
 }
 
 /// Предел длины поискового запроса в библиотеке (в символах).
@@ -122,34 +159,32 @@ pub fn library_search_key(search: &mut String, key: &Key, in_library: bool) -> b
     }
 }
 
-/// Что клавиша делает со списком публичных реплеев в библиотеке.
+/// Что клавиша делает со списком онлайн-лидерборда в библиотеке.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ReplayListKey {
+pub enum LeaderboardKey {
     /// Tab — войти в список или вернуться к песням.
     ToggleFocus,
     Up,
     Down,
-    /// Enter/Space — смотреть выбранный реплей.
-    Watch,
+    /// Enter — открыть детали выбранного плея.
+    Open,
     /// Esc/Backspace — снять фокус (без выхода из библиотеки).
     Back,
 }
 
-/// Раскладка клавиш списка реплеев: без записей список не перехватывает
-/// ничего, поэтому Tab/Space продолжают работать как раньше.
-pub fn replay_list_action(key: &Key, focused: bool, count: usize) -> Option<ReplayListKey> {
+/// Раскладка клавиш лидерборда: без записей список не перехватывает ничего,
+/// поэтому Tab/Space продолжают работать как раньше.
+pub fn leaderboard_action(key: &Key, focused: bool, count: usize) -> Option<LeaderboardKey> {
     if count == 0 {
         return None;
     }
     match key {
-        Key::Named(NamedKey::Tab) => Some(ReplayListKey::ToggleFocus),
-        Key::Named(NamedKey::ArrowDown) if focused => Some(ReplayListKey::Down),
-        Key::Named(NamedKey::ArrowUp) if focused => Some(ReplayListKey::Up),
-        Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) if focused => {
-            Some(ReplayListKey::Watch)
-        }
+        Key::Named(NamedKey::Tab) => Some(LeaderboardKey::ToggleFocus),
+        Key::Named(NamedKey::ArrowDown) if focused => Some(LeaderboardKey::Down),
+        Key::Named(NamedKey::ArrowUp) if focused => Some(LeaderboardKey::Up),
+        Key::Named(NamedKey::Enter) if focused => Some(LeaderboardKey::Open),
         Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Backspace) if focused => {
-            Some(ReplayListKey::Back)
+            Some(LeaderboardKey::Back)
         }
         _ => None,
     }
@@ -182,11 +217,32 @@ pub fn queue_toast(immediate: bool, uploaded: usize, still_queued: bool) -> Opti
     }
 }
 
+/// Первый позиционный аргумент — файл пака (`.deemopack`/`.zip`), который
+/// надо поставить при старте, как drag & drop. Флаги (`-…`) и чужие пути
+/// игнорируются молча: `deemo --x11 song.chart.json` остаётся обычным запуском.
+pub fn pack_path_from_args(args: &[String]) -> Option<std::path::PathBuf> {
+    let arg = args.iter().skip(1).find(|a| !a.starts_with('-'))?;
+    let path = std::path::Path::new(arg);
+    if !path.is_file() {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "deemopack" || ext == "zip" {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
 /// Тост об успешной загрузке: с pp, если сервер его прислал
 /// (`Score uploaded · +172.6 pp`), иначе прежний текст.
 pub fn upload_toast(ack: Option<&crate::online_queue::ScoreAck>) -> String {
     match ack {
-        Some(a) => format!("Score uploaded · +{:.1} pp", a.pp),
+        Some(a) => format!("Score uploaded · {}", crate::pp::ack_tag(a.pp)),
         None => "Score uploaded".to_string(),
     }
 }
@@ -223,7 +279,7 @@ pub struct App {
     gfx: Option<Gfx>,
     songs: Vec<Song>,
     search: String,
-    view_groups: Vec<(String, Vec<usize>)>,
+    view_groups: Vec<(String, Vec<Entry>)>,
     sort_by: crate::library::SortBy,
     group_by: crate::library::GroupBy,
     /// открытый dropdown: 0=сортировка, 1=группировка
@@ -264,16 +320,23 @@ pub struct App {
     lb_rx: Option<std::sync::mpsc::Receiver<(String, Vec<crate::online::OnlineRecord>, Vec<crate::online::ReplayEntry>)>>,
     lb_pending: Option<String>,
     lb_toggle_rect: [f32; 4],
-    /// публичные реплеи выбранной карты: список, фокус клавиатуры и геометрия
-    /// строк (для кликов); ключ — song:diff последнего принятого списка
+    /// выбранная строка лидерборда, фокус клавиатуры и геометрия строк
+    lb_sel: usize,
+    lb_focus: bool,
+    lb_rows: Vec<(usize, [f32; 4])>,
+    /// открытые детали плея (режим поверх библиотеки)
+    lb_detail: Option<PlayDetail>,
+    detail_watch_btn: [f32; 4],
+    detail_close_btn: [f32; 4],
+    /// публичные реплеи выбранной карты (ник → pp/miss и признак «есть реплей»)
     rp_records: Vec<crate::online::ReplayEntry>,
     rp_key: String,
-    rp_sel: usize,
-    rp_focus: bool,
-    rp_rows: Vec<(usize, [f32; 4])>,
-    /// фоновая загрузка одного реплея (DMR1/DMR2): song, diff, nick, blob
+    /// фоновая загрузка одного реплея (DMR1/DMR2/DMR3): song, diff, nick, blob
     rp_blob_rx: Option<Receiver<(usize, usize, String, std::result::Result<Vec<u8>, String>)>>,
     rp_blob_pending: Option<(usize, usize, String)>,
+    /// кэш звёзд сложностей (`song_id:diff` → star) и его фоновое обновление
+    stars: crate::stars::StarMap,
+    stars_rx: Option<Receiver<crate::stars::StarMap>>,
     /// сигнатура папки data/imported (для авто-подхвата новых папок)
     imported_sig: u64,
     last_import_scan: Instant,
@@ -363,15 +426,16 @@ pub struct App {
     auto_shot: Option<(String, Instant)>,
     auto_shot_delay: f32,
     pending_play: Option<(usize, usize)>,
-    card_rects: Vec<(usize, [f32; 4])>,
-    diff_rects: Vec<(usize, [f32; 4])>,
+    /// `.deemopack` из первого аргумента: ставим после открытия окна, чтобы
+    /// тост «Installed …» не истёк за время инициализации GPU.
+    startup_pack: Option<std::path::PathBuf>,
+    card_rects: Vec<(Entry, [f32; 4])>,
     play_btn: [f32; 4],
-    hist_diff_rects: Vec<(usize, [f32; 4])>,
     sort_btn: [f32; 4],
     group_btn: [f32; 4],
     dropdown_rects: Vec<(u8, [f32; 4])>,
     total_h: f32,
-    last_selected: Option<usize>,
+    last_selected: Option<Entry>,
     /// фон меню: миниатюрная падающая сцена выбранного чарта
     bg_field: crate::bg::BgField,
     /// ключ (песня, сложность) чарта, который сейчас пишет в поле
@@ -387,8 +451,7 @@ pub struct App {
     sbar_track: Option<[f32; 4]>,
     sbar_thumb: Option<[f32; 4]>,
     sbar_drag: Option<f32>, // смещение курсора внутри ползунка (px)
-    saved_selected: Option<usize>,
-    saved_diff: usize,
+    saved_selected: Option<Entry>,
     /// запись реплея (сырой ввод) во время игры
     replay: Option<crate::replay::Replay>,
     /// всплывающее уведомление (текст, момент показа)
@@ -413,8 +476,18 @@ impl App {
         let settings = crate::settings::load();
         let preselect = std::env::var("DEEMO_SELECT")
             .ok()
-            .and_then(|id| songs.iter().position(|s| s.id == id))
-            .or_else(|| if songs.is_empty() { None } else { Some(0) });
+            .and_then(|id| {
+                songs
+                    .iter()
+                    .position(|s| s.id == id)
+                    .map(|si| Entry::new(si, 0))
+            })
+            .or_else(|| {
+                songs
+                    .iter()
+                    .position(|s| !s.charts.is_empty())
+                    .map(|si| Entry::new(si, 0))
+            });
         Ok(App {
             wayland_dnd: None,
             gfx: None,
@@ -447,13 +520,18 @@ impl App {
             lb_rx: None,
             lb_pending: None,
             lb_toggle_rect: [0.0; 4],
+            lb_sel: 0,
+            lb_focus: false,
+            lb_rows: Vec::new(),
+            lb_detail: None,
+            detail_watch_btn: [0.0; 4],
+            detail_close_btn: [0.0; 4],
             rp_records: Vec::new(),
             rp_key: String::new(),
-            rp_sel: 0,
-            rp_focus: false,
-            rp_rows: Vec::new(),
             rp_blob_rx: None,
             rp_blob_pending: None,
+            stars: crate::stars::load(),
+            stars_rx: None,
             imported_sig: 0,
             last_import_scan: Instant::now(),
             covers: HashMap::new(),
@@ -469,7 +547,6 @@ impl App {
             mode: Mode::Library {
                 scroll: 0.0,
                 selected: preselect,
-                diff: 0,
             },
             speed: settings.speed.clamp(0.5, 9.5),
             scroll_speed: settings.scroll_speed.clamp(0.25, 5.0),
@@ -509,6 +586,7 @@ impl App {
             mouse_x: 0.0,
             cursor_grabbed: false,
             pending_play,
+            startup_pack: None,
             cursor: [0.0, 0.0],
             auto_shot: std::env::var("DEEMO_AUTOSHOT").ok().map(|p| (p, Instant::now())),
             auto_shot_delay: std::env::var("DEEMO_AUTOSHOT_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5),
@@ -517,9 +595,7 @@ impl App {
             next_frame: Instant::now(),
             cover_rx: None,
             card_rects: Vec::new(),
-            diff_rects: Vec::new(),
             play_btn: [0.0; 4],
-            hist_diff_rects: Vec::new(),
             sort_btn: [0.0; 4],
             group_btn: [0.0; 4],
             dropdown_rects: Vec::new(),
@@ -535,7 +611,6 @@ impl App {
             sbar_thumb: None,
             sbar_drag: None,
             saved_selected: None,
-            saved_diff: 0,
             replay: None,
             toast: None,
         })
@@ -661,7 +736,7 @@ impl App {
         let _ = self.start_play_impl(song, diff, None);
     }
 
-    /// Запуск карты. `replay` — просмотр записанного DMR1/DMR2 вместо игры: драйвер
+    /// Запуск карты. `replay` — просмотр записанного DMR1/DMR2/DMR3 вместо игры: драйвер
     /// проверяет, что блоб описывает ровно этот чарт, и играет его без ввода.
     fn start_play_impl(
         &mut self,
@@ -670,10 +745,9 @@ impl App {
         replay: Option<(&str, &crate::replay::ReplayBlob)>,
     ) -> std::result::Result<(), String> {
         // запоминаем позицию библиотеки, чтобы вернуть её после игры
-        if let Mode::Library { scroll, selected, diff: d } = &self.mode {
+        if let Mode::Library { scroll, selected } = &self.mode {
             self.saved_scroll = *scroll;
             self.saved_selected = *selected;
-            self.saved_diff = *d;
         }
         let Some(c) = self.songs[song].charts.get(diff) else {
             return Err("Chart is not available".into());
@@ -747,6 +821,10 @@ impl App {
             paused: false,
             driver,
         };
+        // детали плея/фокус лидерборда не должны остаться поверх игры
+        self.lb_detail = None;
+        self.detail_watch_btn = [0.0; 4];
+        self.detail_close_btn = [0.0; 4];
         self.mouse_x = 0.0;
         self.music_ended_at = None;
         self.mouse_tap_errors.clear();
@@ -777,14 +855,14 @@ impl App {
         }
     }
 
-    /// Запросить блоб выбранной строки списка (сеть — в фоне, кадр не стоит).
-    fn start_replay_download(&mut self) {
+    /// Запросить блоб реплея этого ника для выбранного чарта (сеть — в фоне,
+    /// кадр не стоит). Путь тот же, что был у строки списка реплеев.
+    fn start_replay_download(&mut self, nick: &str) {
         let (si, diff) = match &self.mode {
-            Mode::Library { selected: Some(si), diff, .. } => (*si, *diff),
+            Mode::Library { selected: Some(e), .. } => (e.song, e.diff),
             _ => return,
         };
-        let Some(entry) = self.rp_records.get(self.rp_sel) else { return };
-        let nick = entry.nick.trim().to_string();
+        let nick = nick.trim().to_string();
         if nick.is_empty() {
             return;
         }
@@ -808,6 +886,122 @@ impl App {
             let _ = tx.send((si, diff, nick, res));
         });
     }
+
+    /// «СМОТРЕТЬ РЕПЛЕЙ» в деталях: только если сервер отдал публичный реплей
+    /// этого ника на эту карту.
+    fn watch_detail_replay(&mut self) {
+        let Some(detail) = &self.lb_detail else { return };
+        if !detail.can_watch() {
+            return;
+        }
+        let nick = detail.record.nickname.clone();
+        self.start_replay_download(&nick);
+    }
+
+    /// Открыть детали плея по строке лидерборда. Реплей ищется по нику в
+    /// публичном списке карты; его отсутствие — не ошибка, кнопка просто
+    /// выключена.
+    fn open_play_detail(&mut self, idx: usize) {
+        let Some(rec) = self.lb_records.get(idx).cloned() else { return };
+        let star = match &self.mode {
+            Mode::Library { selected: Some(e), .. } => {
+                let song = match self.songs.get(e.song) {
+                    Some(s) => s,
+                    None => return,
+                };
+                crate::stars::star(&self.stars, &song.id, song.chart_diff(e.diff))
+            }
+            _ => None,
+        };
+        self.lb_sel = idx;
+        self.lb_focus = true;
+        self.lb_detail = Some(detail_for_record(&rec, &self.rp_records, star));
+    }
+
+    fn close_play_detail(&mut self) {
+        self.lb_detail = None;
+        self.detail_watch_btn = [0.0; 4];
+        self.detail_close_btn = [0.0; 4];
+        // возвращаем фокус лидерборду: клавиатурный путь не теряется
+        self.lb_focus = true;
+    }
+
+    /// Клавиши открытых деталей: Esc/Backspace — закрыть, Enter — смотреть.
+    /// true — клавиша обработана.
+    fn detail_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        let Some(detail) = &self.lb_detail else { return false };
+        match key {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                self.close_play_detail();
+                true
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                if detail.can_watch() {
+                    self.watch_detail_replay();
+                    true
+                } else {
+                    true // Enter не проваливается в запуск карты под оверлеем
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Клавиши лидерборда (см. [`leaderboard_action`]). Активны только когда
+    /// список действительно показан: онлайн-режим + вход + записи.
+    fn leaderboard_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        if !self.lb_online || !self.online.logged_in() || self.lb_records.is_empty() {
+            return false;
+        }
+        let count = self.lb_records.len();
+        let Some(action) = leaderboard_action(key, self.lb_focus, count) else {
+            return false;
+        };
+        match action {
+            LeaderboardKey::ToggleFocus => self.lb_focus = !self.lb_focus,
+            LeaderboardKey::Up => self.lb_sel = self.lb_sel.saturating_sub(1),
+            LeaderboardKey::Down => self.lb_sel = (self.lb_sel + 1).min(count - 1),
+            LeaderboardKey::Open => {
+                let sel = self.lb_sel.min(count - 1);
+                self.open_play_detail(sel);
+            }
+            LeaderboardKey::Back => self.lb_focus = false,
+        }
+        true
+    }
+
+    /// Фоновое обновление кэша звёзд (публичный `/api/packs`, без токена).
+    /// Повторный запрос не ставится, пока не пришёл предыдущий.
+    fn request_stars(&mut self) {
+        if self.stars_rx.is_some() {
+            return;
+        }
+        let server = self.online.state.server.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.stars_rx = Some(rx);
+        std::thread::spawn(move || {
+            if let Ok(map) = crate::stars::fetch(&server) {
+                let _ = tx.send(map);
+            }
+        });
+    }
+
+    /// Принять новый кэш звёзд (вызывается каждый кадр, как lb_rx). Ошибки
+    /// сети молчат: остаётся прежний кэш.
+    fn poll_stars(&mut self) {
+        let Some(rx) = &self.stars_rx else { return };
+        match rx.try_recv() {
+            Ok(map) => {
+                self.stars = map;
+                crate::stars::save(&self.stars);
+                self.stars_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.stars_rx = None,
+        }
+    }
+
 
     /// Превью песни в меню (отдельный ~20-сек клип <id>_pv из ассетов).
     fn play_preview(&mut self, song: usize) {
@@ -845,16 +1039,16 @@ impl App {
     /// Смена песни/сложности НЕ чистит уже падающее поле: сразу гасим эмиссию
     /// из старого источника, а когда придёт новый — ставим его курсор на
     /// текущую позицию превью. Старые ноты продолжают падать сами по себе.
-    fn ensure_bg_source(&mut self, selected: Option<usize>, diff: usize) {
-        let Some(si) = selected else {
+    fn ensure_bg_source(&mut self, selected: Option<Entry>) {
+        let Some(e) = selected else {
             // ничего не выбрано — новых нот не будет, но поле доедет само
             if self.bg_key.take().is_some() {
                 self.bg_field.clear_source();
             }
             return;
         };
-        let Some(song) = self.songs.get(si) else { return };
-        let Some(chart) = song.charts.get(diff) else { return };
+        let Some(song) = self.songs.get(e.song) else { return };
+        let Some(chart) = song.charts.get(e.diff) else { return };
         let key = (song.id.clone(), chart.diff.clone());
         if self.bg_key.as_ref() == Some(&key) {
             return;
@@ -952,15 +1146,14 @@ impl App {
         if let Some(g) = self.gfx.as_ref() {
             g.music.pause();
         }
-        // выход из просмотра реплея возвращает фокус на его список: игрок
+        // выход из просмотра реплея возвращает фокус на лидерборд: игрок
         // сразу может выбрать следующий, без мыши
-        if matches!(&self.mode, Mode::Play { driver: Some(_), .. }) && !self.rp_records.is_empty() {
-            self.rp_focus = true;
+        if matches!(&self.mode, Mode::Play { driver: Some(_), .. }) && !self.lb_records.is_empty() {
+            self.lb_focus = true;
         }
         self.mode = Mode::Library {
             scroll: self.saved_scroll,
             selected: self.saved_selected,
-            diff: self.saved_diff,
         };
         self.replay = None;
         self.set_play_cursor(false);
@@ -975,13 +1168,20 @@ impl App {
         if let Ok(songs) = crate::library::load() {
             self.songs = songs;
             if let Mode::Library { selected, .. } = &mut self.mode {
-                *selected = prev_sel.filter(|&s| s < self.songs.len());
+                *selected = prev_sel.filter(|e| {
+                    self.songs
+                        .get(e.song)
+                        .map(|s| e.diff < s.charts.len())
+                        .unwrap_or(false)
+                });
             }
             // сброс кэша полноразмерных артов, т.к. набор песен изменился
             self.full_dims.clear();
             // новые паки (инбокс, F5, установка на лету) — догрузить их
             // миниатюры без перезапуска игры
             self.spawn_cover_preloader();
+            // каталог сервера мог измениться вместе с паками — звёзды в фон
+            self.request_stars();
             // ноты фона тоже могли переехать — перечитаем при следующем кадре
             self.bg_key = None;
             self.bg_field.clear_source();
@@ -1122,8 +1322,7 @@ impl App {
 
     /// Геометрия меню (общая для layout и draw_library): ранкинг слева,
     /// список песен в центре, целый арт песни справа, нижняя полоса.
-    fn menu_geom(&self, selected: Option<usize>) -> screens::LibGeom {
-        let (w, h) = self.size();
+    fn menu_geom(&self, selected: Option<usize>) -> screens::LibGeom {        let (w, h) = self.size();
         let aspect = selected
             .and_then(|si| self.full_dims.get(&si))
             .map(|&(w, h)| w as f32 / h.max(1) as f32);
@@ -1141,38 +1340,28 @@ impl App {
         if matches!(self.mode, Mode::Play { paused: true, .. }) {
             self.pause_rects = screens::pause_layout(wf, hf).buttons;
         }
-        let (scroll, selected, diff) = match &self.mode {
-            Mode::Library { scroll, selected, diff } => (*scroll, *selected, *diff),
+        let (scroll, selected) = match &self.mode {
+            Mode::Library { scroll, selected } => (*scroll, *selected),
             _ => return,
         };
-        // фон: настоящие ноты выбранной песни (перезагрузка при смене песни/сложности)
-        self.ensure_bg_source(selected, diff);
-        let geom = self.menu_geom(selected);
+        // фон: настоящие ноты выбранного чарта (перезагрузка при смене строки)
+        self.ensure_bg_source(selected);
+        let geom = self.menu_geom(selected.map(|e| e.song));
 
-        // сортировка + группировка (общая логика из library)
-        let score_of = |i: usize| self.results.best_song(&self.songs[i].id).map(|r| r.score).unwrap_or(0);
-        let groups = crate::library::sort_group(&self.songs, self.sort_by, self.group_by, score_of);
-        // фильтр поиска по названию/композитору/альбому
-        let q = self.search.trim().to_lowercase();
-        self.view_groups = if q.is_empty() {
-            groups
-        } else {
-            groups
-                .into_iter()
-                .filter_map(|(name, idxs)| {
-                    let hit: Vec<usize> = idxs
-                        .into_iter()
-                        .filter(|&i| {
-                            let s = &self.songs[i];
-                            s.title.to_lowercase().contains(&q)
-                                || s.composer.to_lowercase().contains(&q)
-                                || s.album.to_lowercase().contains(&q)
-                        })
-                        .collect();
-                    if hit.is_empty() { None } else { Some((name, hit)) }
-                })
-                .collect()
-        };
+        // сортировка + группировка по строкам-чартам (osu!-стиль)
+        let groups = crate::library::sort_group(
+            &self.songs,
+            self.sort_by,
+            self.group_by,
+            &self.stars,
+            |e| {
+                let Some(song) = self.songs.get(e.song) else { return 0 };
+                let diff = song.chart_diff(e.diff);
+                self.results.best(&song.id, diff).map(|r| r.score).unwrap_or(0)
+            },
+        );
+        // фильтр: поиск по песне + (если появится диапазон) звёзды по строке
+        self.view_groups = crate::library::filter_entries(groups, &self.songs, &self.search, &self.stars, None);
 
         let view_h = (hf - geom.top_h - geom.bot_h).max(1.0);
         let (_, _, total_h) = screens::library_rows(&self.view_groups, &geom, 0.0);
@@ -1182,9 +1371,9 @@ impl App {
         let mut scroll = scroll;
         if selected != self.last_selected {
             self.last_selected = selected;
-            if let Some(si) = selected {
+            if let Some(e) = selected {
                 let (cards, _, _) = screens::library_rows(&self.view_groups, &geom, 0.0);
-                if let Some(&(_, r)) = cards.iter().find(|(i, _)| *i == si) {
+                if let Some(&(_, r)) = cards.iter().find(|(entry, _)| *entry == e) {
                     let view_top = geom.top_h + 8.0 * geom.s;
                     let view_bot = hf - geom.bot_h - 8.0 * geom.s;
                     if r[1] < view_top || r[1] + geom.row_h > view_bot {
@@ -1230,49 +1419,20 @@ impl App {
             }
         }
 
-        // кнопки сложности — переключают сложность (не запускают), в нижней полосе
-        self.diff_rects.clear();
-        if let Some(si) = selected {
-            if let Some(song) = self.songs.get(si) {
-                let n = song.charts.len();
-                self.diff_rects = screens::diff_chip_rects(wf, hf, &geom, &chrome, n);
-            }
+        // строки лидерборда: та же геометрия, что и у отрисовки
+        self.lb_rows.clear();
+        let leaders = self.lb_online && logged_in && selected.is_some();
+        if leaders {
+            self.lb_rows = screens::leaderboard_rows(&geom, hf - geom.bot_h, self.lb_records.len());
+            self.lb_sel = self.lb_sel.min(self.lb_records.len().saturating_sub(1));
+        } else {
+            // список скрыт — фокус/детали не залипают
+            self.lb_focus = false;
         }
-        // вкладки сложности в панели истории — фильтр по сложности
-        self.hist_diff_rects.clear();
-        if let Some(si) = selected {
-            let n = self.songs.get(si).map_or(1, |s| s.charts.len().max(1));
-            let tab_w = (geom.left_w - geom.margin * 2.0) / n as f32;
-            for d in 0..n {
-                self.hist_diff_rects.push((
-                    d,
-                    [
-                        geom.margin + d as f32 * tab_w,
-                        geom.top_h + 108.0 * geom.s,
-                        (tab_w - 4.0 * geom.s).max(20.0 * geom.s),
-                        26.0 * geom.s,
-                    ],
-                ));
-            }
-        }
-        // строки публичных реплеев: та же геометрия, что и у отрисовки
-        self.rp_rows.clear();
-        if selected.is_some() {
-            if !self.rp_records.is_empty() {
-                let rp = screens::replays_layout(
-                    &geom,
-                    hf - geom.bot_h,
-                    self.rp_records.len(),
-                    self.rp_sel,
-                );
-                self.rp_rows = rp.rows;
-            }
-        } else if !self.rp_records.is_empty() {
-            // без выбранной песни списка нет вовсе (и фокус не залипает)
+        if selected.is_none() {
+            // без выбранной карты секции лидерборда/реплеев нет вовсе
             self.rp_records.clear();
             self.rp_key.clear();
-            self.rp_sel = 0;
-            self.rp_focus = false;
         }
         self.lib_geom = Some(geom);
     }
@@ -1320,6 +1480,12 @@ impl ApplicationHandler for App {
             .with_title("Deemo")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
+        // file association for .deemopack — background, silent, right after the
+        // window exists; never blocks the first frame or the GPU setup
+        std::thread::spawn(|| match crate::assoc::register() {
+            Ok(msg) => crate::assoc::log(&msg),
+            Err(e) => crate::assoc::log(&format!("assoc: skipped ({e})")),
+        });
         if self.fullscreen {
             window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -1372,6 +1538,9 @@ impl ApplicationHandler for App {
             renderer,
             music,
         });
+        if let Some(path) = self.startup_pack.take() {
+            self.install_pack_path(&path);
+        }
         if let Some((s, d)) = self.pending_play.take() {
             self.start_play(s, d);
         }
@@ -1395,6 +1564,8 @@ impl ApplicationHandler for App {
         let server = self.online.state.server.clone();
         self.queue.flush(&server);
         self.last_queue_flush = Instant::now();
+        // звёзды сложностей: в фоне, кадр не ждёт (при ошибке остаётся кэш)
+        self.request_stars();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1423,7 +1594,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.settings.is_some() {
+                if self.settings.is_some() || self.lb_detail.is_some() {
                     return;
                 }
                 let dy = match delta {
@@ -1536,9 +1707,9 @@ impl ApplicationHandler for App {
                         self.lb_records = recs;
                         self.rp_key = self.chart_key().unwrap_or_default();
                         self.rp_records = replays;
-                        self.rp_sel = self.rp_sel.min(self.rp_records.len().saturating_sub(1));
-                        if self.rp_records.is_empty() {
-                            self.rp_focus = false;
+                        self.lb_sel = self.lb_sel.min(self.lb_records.len().saturating_sub(1));
+                        if self.lb_records.is_empty() {
+                            self.lb_focus = false;
                         }
                     }
                     self.lb_pending = None;
@@ -1553,6 +1724,8 @@ impl ApplicationHandler for App {
             }
         }
         self.poll_replay_blob();
+        // кэш звёзд сложностей (публичный каталог, фоновый поток)
+        self.poll_stars();
         // вход/регистрация из экрана настроек (фон)
         self.poll_auth();
         // фон меню: ноты выбранного чарта (фоновый поток)
@@ -1612,18 +1785,29 @@ impl App {
         // ветке `Key::Character` молча выбрасывает «!», «#», «(», «%» и прочую
         // пунктуацию («пробел/другие символы в поиске не печатаются»).
         if matches!(self.mode, Mode::Library { .. }) {
-            // фокус на публичных реплеях: Tab входит/выходит, Up/Down, Enter/Space
-            if self.replay_list_key(&key) {
+            // открытые детали плея — модальный экран: остальные клавиши не
+            // должны менять поиск/выбор под ним
+            if self.lb_detail.is_some() {
+                let _ = self.detail_key(&key);
+                return;
+            }
+            // фокус на лидерборде: Tab входит/выходит, Up/Down, Enter
+            if self.leaderboard_key(&key) {
                 return;
             }
             // быстрая навигация: Home/End/PageUp/PageDown
             if self.list_key_nav(&key) {
                 return;
             }
+            // Up/Down — по строкам-чартам (osu!-стиль). Ctrl+Up/Down остаётся
+            // прежним хоткеем скорости.
+            if self.list_key_move(&key) {
+                return;
+            }
             if library_search_key(&mut self.search, &key, true) {
-                // печатный ввод — снова поиск: фокус списка реплеев не должен
+                // печатный ввод — снова поиск: фокус лидерборда не должен
                 // перехватывать следующие пробелы
-                self.rp_focus = false;
+                self.lb_focus = false;
                 if let Mode::Library { scroll, .. } = &mut self.mode {
                     *scroll = 0.0;
                 }
@@ -1632,8 +1816,7 @@ impl App {
         }
         match key {
             Key::Named(NamedKey::Escape) => match &self.mode {
-                Mode::Library { selected, diff, .. } => {
-                    let diff = *diff;
+                Mode::Library { selected, .. } => {
                     if self.open_dropdown.is_some() {
                         self.open_dropdown = None;
                     } else if !self.search.is_empty() {
@@ -1642,7 +1825,6 @@ impl App {
                         self.mode = Mode::Library {
                             scroll: self.scroll(),
                             selected: None,
-                            diff,
                         };
                     } else {
                         event_loop.exit();
@@ -1695,8 +1877,8 @@ impl App {
             Key::Named(NamedKey::Enter) => {
                 match &self.mode {
                     Mode::Result { .. } => self.to_library(),
-                    Mode::Library { selected: Some(si), diff, .. } => {
-                        let (si, diff) = (*si, *diff);
+                    Mode::Library { selected: Some(e), .. } => {
+                        let (si, diff) = (e.song, e.diff);
                         self.start_play(si, diff);
                     }
                     _ => {}
@@ -2130,6 +2312,8 @@ impl App {
             self.packs_cancel = None;
             self.packs.finish(p);
             self.packs.refresh_installed();
+            // новые паки: звёзды могли появиться в каталоге — обновляем кэш
+            self.request_stars();
             let msg = format!(
                 "Packs: {} installed · {} failed",
                 self.packs.prog.done + self.packs.prog.skipped,
@@ -2312,6 +2496,40 @@ impl App {
         true
     }
 
+    /// Up/Down по плоскому списку чартов. Ctrl+Up/Down не трогаем — это
+    /// прежний хоткей скорости.
+    fn list_key_move(&mut self, key: &winit::keyboard::Key) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        if self.key_mods.control_key() {
+            return false;
+        }
+        let down = matches!(key, Key::Named(NamedKey::ArrowDown));
+        let up = matches!(key, Key::Named(NamedKey::ArrowUp));
+        if !down && !up {
+            return false;
+        }
+        let flat: Vec<Entry> = self
+            .view_groups
+            .iter()
+            .flat_map(|(_, v)| v.iter().copied())
+            .collect();
+        if flat.is_empty() {
+            return true;
+        }
+        let cur = match &self.mode {
+            Mode::Library { selected, .. } => *selected,
+            _ => None,
+        };
+        let Some(next) = step_entry(&flat, cur, down) else { return true };
+        if cur.map(|c| c.song) != Some(next.song) {
+            self.play_preview(next.song);
+        }
+        if let Mode::Library { selected, .. } = &mut self.mode {
+            *selected = Some(next);
+        }
+        true
+    }
+
     /// Быстрая навигация по списку с клавиатуры (Home/End/PageUp/PageDown).
     fn list_key_nav(&mut self, key: &winit::keyboard::Key) -> bool {
         use winit::keyboard::{Key, NamedKey};
@@ -2346,23 +2564,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    /// Клавиши списка публичных реплеев (см. [`replay_list_action`]).
-    /// true — клавиша обработана и не должна идти дальше в поиск/хоткеи.
-    fn replay_list_key(&mut self, key: &winit::keyboard::Key) -> bool {
-        let count = self.rp_records.len();
-        let Some(action) = replay_list_action(key, self.rp_focus, count) else {
-            return false;
-        };
-        match action {
-            ReplayListKey::ToggleFocus => self.rp_focus = !self.rp_focus,
-            ReplayListKey::Up => self.rp_sel = self.rp_sel.saturating_sub(1),
-            ReplayListKey::Down => self.rp_sel = (self.rp_sel + 1).min(count - 1),
-            ReplayListKey::Watch => self.start_replay_download(),
-            ReplayListKey::Back => self.rp_focus = false,
-        }
-        true
     }
 
     fn on_click(&mut self) {
@@ -2452,20 +2653,31 @@ impl App {
             self.to_library();
             return;
         }
-        let (selected, cur_diff) = match &self.mode {
-            Mode::Library { selected, diff, .. } => (*selected, *diff),
-            _ => (None, 0),
+        // открытые детали плея: только watch/close/клик мимо
+        if self.lb_detail.is_some() {
+            let watch = self.detail_watch_btn;
+            let close = self.detail_close_btn;
+            if in_rect(px, py, watch) {
+                self.watch_detail_replay();
+            } else if in_rect(px, py, close) {
+                self.close_play_detail();
+            } else {
+                // клик по фону — закрыть, как Esc
+                self.close_play_detail();
+            }
+            return;
+        }
+        let selected = match &self.mode {
+            Mode::Library { selected, .. } => *selected,
+            _ => None,
         };
         let scroll = self.scroll();
-        // строка публичного реплея: клик = выбрать и смотреть (клавиатура —
-        // Tab/Up/Down/Enter, мышь лишь повторяет её путь)
-        if selected.is_some() && self.open_dropdown.is_none() {
-            let rows = self.rp_rows.clone();
+        // строка лидерборда: клик = выбрать и открыть детали, как Enter
+        if selected.is_some() && self.open_dropdown.is_none() && !self.lb_rows.is_empty() {
+            let rows = self.lb_rows.clone();
             for &(i, r) in &rows {
                 if in_rect(px, py, r) {
-                    self.rp_sel = i;
-                    self.rp_focus = true;
-                    self.start_replay_download();
+                    self.open_play_detail(i);
                     return;
                 }
             }
@@ -2482,7 +2694,7 @@ impl App {
                         self.group_by = crate::library::GroupBy::ALL[i as usize];
                     }
                     self.open_dropdown = None;
-                    self.mode = Mode::Library { scroll: 0.0, selected, diff: cur_diff };
+                    self.mode = Mode::Library { scroll: 0.0, selected };
                     return;
                 }
             }
@@ -2506,6 +2718,8 @@ impl App {
         // тумблер локально/онлайн в панели рекордов
         if self.online.logged_in() && in_rect(px, py, self.lb_toggle_rect) {
             self.lb_online = !self.lb_online;
+            self.lb_focus = false;
+            self.lb_sel = 0;
             return;
         }
         // кнопки sort/group
@@ -2517,46 +2731,26 @@ impl App {
             self.open_dropdown = Some(1);
             return;
         }
-        // вкладки сложности в панели истории — фильтр по сложности
-        let htabs = self.hist_diff_rects.clone();
-        for &(d, r) in &htabs {
-            if in_rect(px, py, r) {
-                self.mode = Mode::Library { scroll, selected, diff: d };
-                return;
-            }
-        }
-        // Play — запуск выбранной песни + сложности
-        if let Some(si) = selected {
+        // Play — запуск выбранного чарта
+        if let Some(e) = selected {
             if in_rect(px, py, self.play_btn) {
-                self.start_play(si, cur_diff);
+                self.start_play(e.song, e.diff);
                 return;
             }
         }
-        // кнопки сложности — переключают сложность (история фильтруется), не запускают
-        let diffs = self.diff_rects.clone();
         let cards = self.card_rects.clone();
-        if selected.is_some() {
-            for &(d, r) in &diffs {
-                if in_rect(px, py, r) {
-                    self.mode = Mode::Library { scroll, selected, diff: d };
-                    return;
-                }
-            }
-        }
         let (wf, hf) = self.size();
         let hf = hf as f32;
         let scale = crate::theme::ui_scale(wf as f32, hf);
-        for &(si, r) in &cards {
+        for &(e, r) in &cards {
             if py < screens::TOP_H * scale || py > hf - screens::BOT_H * scale {
                 continue;
             }
             if in_rect(px, py, r) {
-                if selected != Some(si) {
-                    self.play_preview(si);
+                if selected.map(|s| s.song) != Some(e.song) {
+                    self.play_preview(e.song);
                 }
-                let nd = self.songs[si].charts.len();
-                let d = cur_diff.min(nd.saturating_sub(1));
-                self.mode = Mode::Library { scroll, selected: Some(si), diff: d };
+                self.mode = Mode::Library { scroll, selected: Some(e) };
                 return;
             }
         }
@@ -2573,7 +2767,7 @@ impl App {
             && py > screens::TOP_H * scale
             && py < hf - screens::BOT_H * scale;
         if selected.is_some() && in_list_area {
-            self.mode = Mode::Library { scroll, selected: None, diff: cur_diff };
+            self.mode = Mode::Library { scroll, selected: None };
         }
     }
 
@@ -2640,8 +2834,6 @@ impl App {
                     }
                 } else {
                     play.update(chart, t);
-                    // позиция указателя этого кадра: активное перо важнее мыши
-                    let pointer_x = tablet_x.unwrap_or(self.mouse_x);
                     // раздельные оффсеты ввода: + сдвигает тап/слайд позже
                     let tm = t + input_mouse / 1000.0;
                     let tt = t + input_tablet / 1000.0;
@@ -2701,9 +2893,13 @@ impl App {
                             }
                         }
                     }
-                    // трек курсора: старт, каждые ~60 мс, при сдвиге ≥0.1 pos
+                    // два независимых трека: мышь и перо (перо — даже при
+                    // hover, если планшет активен)
                     if let Some(r) = &mut self.replay {
-                        r.track_sample(t, pointer_x);
+                        r.track_mouse(t, self.mouse_x);
+                        if let Some(px) = tablet_x {
+                            r.track_pen(t, px);
+                        }
                     }
                     let dur = g.music.duration();
                     let mut finish =
@@ -2716,12 +2912,13 @@ impl App {
                         }
                     }
                     if finish {
-                        // DMR2 уезжает вместе со скором; при разной длине
+                        // DMR3 уезжает вместе со скором; при разной длине
                         // чарта и плея поля в теле просто нет
                         let replay = match &mut self.replay {
                             Some(r) => {
-                                r.track_end(t, pointer_x);
-                                crate::replay::dmr2_base64(chart, play, r.track())
+                                r.track_end(t, self.mouse_x, tablet_x);
+                                let (left, right) = r.tracks();
+                                crate::replay::dmr3_base64(chart, play, right, left)
                             }
                             None => None,
                         };
@@ -2825,11 +3022,11 @@ impl App {
         if self.settings.is_some() {
             self.draw_settings(&mut ui);
         } else if matches!(self.mode, Mode::Library { .. }) {
-            let (selected, diff) = match &self.mode {
-                Mode::Library { selected, diff, .. } => (*selected, *diff),
-                _ => (None, 0),
+            let selected = match &self.mode {
+                Mode::Library { selected, .. } => *selected,
+                _ => None,
             };
-            self.draw_library(&mut ui, selected, diff);
+            self.draw_library(&mut ui, selected);
         } else if let Mode::Play { chart, play, paused, song, diff, clock, driver, .. } = &self.mode {
             let t = clock.current();
             let mut scene = Scene::with_play(chart, self.speed, play);
@@ -2849,7 +3046,7 @@ impl App {
                     sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
                 }
             } else if let Some(driver) = driver {
-                // курсор/DMR2: точка по треку + кольцо на попадании
+                // курсор реплея: два вертикальных луча (левая/правая рука)
                 crate::scene::push_replay_cursor(&mut sprites, driver, t);
             }
             self.draw_hud(&mut ui, *song, *diff, play, t, *paused, driver.as_ref());
@@ -2922,7 +3119,7 @@ impl App {
         }
     }
 
-    fn draw_library(&mut self, ui: &mut Vec<UiQuad>, selected: Option<usize>, diff: usize) {
+    fn draw_library(&mut self, ui: &mut Vec<UiQuad>, selected: Option<Entry>) {
         let (w, h) = self.size();
         let wf = w as f32;
         let hf = h as f32;
@@ -2930,9 +3127,9 @@ impl App {
         // Запрос нужен и без входа в аккаунт (список реплеев публичный), но
         // в headless-скриншотах сеть не трогаем — берём фикстуру.
         if self.gfx.is_some() {
-            if let Some(si) = selected {
-                if let Some(chart) = self.songs[si].charts.get(diff) {
-                    let sid = self.songs[si].id.clone();
+            if let Some(e) = selected {
+                if let Some(chart) = self.songs.get(e.song).and_then(|s| s.charts.get(e.diff)) {
+                    let sid = self.songs[e.song].id.clone();
                     let dn = chart.diff.clone();
                     let want_lb = self.lb_online && self.online.logged_in();
                     self.request_leaderboard(&sid, &dn, want_lb);
@@ -2943,20 +3140,20 @@ impl App {
         // обложки видимых строк + арт выбранной песни
         let scale = crate::theme::ui_scale(wf, hf);
         let mut covers: HashMap<usize, usize> = HashMap::new();
-        for &(si, r) in &self.card_rects {
+        for &(e, r) in &self.card_rects {
             if r[1] + r[3] < screens::TOP_H * scale || r[1] > hf {
                 continue;
             }
-            if let Some(handle) = self.cover(si) {
-                covers.insert(si, handle);
+            if let Some(handle) = self.cover(e.song) {
+                covers.insert(e.song, handle);
             }
         }
-        if let Some(si) = selected {
-            if let Some(handle) = self.cover(si) {
-                covers.insert(si, handle);
+        if let Some(e) = selected {
+            if let Some(handle) = self.cover(e.song) {
+                covers.insert(e.song, handle);
             }
         }
-        let art = selected.and_then(|si| self.full_cover(si));
+        let art = selected.and_then(|e| self.full_cover(e.song));
         let scroll = self.scroll();
         let (cur_x, cur_y) = (self.cursor[0], self.cursor[1]);
         let row_h = self
@@ -2972,7 +3169,15 @@ impl App {
                     && r[1] + row_h <= hf - screens::BOT_H * scale
                     && in_rect(cur_x, cur_y, *r)
             })
-            .map(|(si, _)| *si);
+            .map(|(e, _)| *e);
+        let lb_hover = if selected.is_some() {
+            self.lb_rows
+                .iter()
+                .find(|(_, r)| in_rect(cur_x, cur_y, *r))
+                .map(|(i, _)| *i)
+        } else {
+            None
+        };
         let anim_t = self.anim_t();
         let Some(geom) = self.lib_geom.clone() else {
             return;
@@ -3030,10 +3235,10 @@ impl App {
             songs: &self.songs,
             results: &self.results,
             online: &self.online,
+            stars: &self.stars,
             cards: &self.card_rects,
             headers: &self.lib_headers,
             selected,
-            diff,
             search: &self.search,
             sort_label,
             group_label,
@@ -3043,11 +3248,10 @@ impl App {
             lb_online: self.lb_online,
             lb_pending,
             lb_records: &self.lb_records,
-            replays: &self.rp_records,
-            replay_sel: self.rp_sel,
-            replay_focus: self.rp_focus,
-            hist_rects: &self.hist_diff_rects,
-            diff_rects: &self.diff_rects,
+            lb_sel: self.lb_sel,
+            lb_focus: self.lb_focus,
+            lb_rows: &self.lb_rows,
+            lb_hover,
             dropdown,
             total_h: self.total_h,
             scroll,
@@ -3056,6 +3260,48 @@ impl App {
             bg_t: self.bg_view_time(),
         };
         screens::draw_library(&ctx, &view, ui);
+
+        // детали плея — поверх библиотеки, та же типографика, что у результата
+        if self.lb_detail.is_some() {
+            let ui_rects = self.draw_play_detail_overlay(ui, &ctx);
+            self.detail_watch_btn = ui_rects.watch_btn;
+            self.detail_close_btn = ui_rects.close_btn;
+        }
+    }
+
+    /// Нарисовать открытые детали плея и вернуть интерактивные прямоугольники.
+    fn draw_play_detail_overlay(&self, ui: &mut Vec<UiQuad>, ctx: &screens::Ctx) -> screens::PlayDetailUi {
+        let Some(detail) = &self.lb_detail else {
+            return screens::PlayDetailUi {
+                watch_btn: [0.0; 4],
+                close_btn: [0.0; 4],
+            };
+        };
+        // карта, на которой открыт оверлей (выбор не мог уехать: библиотека
+        // под ним не кликается)
+        let (song_title, artist, diff_name) = match &self.mode {
+            Mode::Library { selected: Some(e), .. } => {
+                let song = &self.songs[e.song];
+                let chart = &song.charts[e.diff];
+                (song.title.as_str(), song.composer.as_str(), chart.diff.as_str())
+            }
+            _ => ("", "", ""),
+        };
+        // звезда — снимок момента открытия деталей (detail.star)
+        let star = detail.star;
+        let can_watch = detail.can_watch();
+        let reason = detail.watch_reason();
+        let view = screens::PlayDetailView {
+            song_title,
+            artist,
+            diff: diff_name,
+            star,
+            record: &detail.record,
+            replay: detail.replay.as_ref(),
+            can_watch,
+            reason,
+        };
+        screens::draw_play_detail(ctx, &view, ui)
     }
 
     fn on_key_login(&mut self, key: Key, event_loop: &ActiveEventLoop) {
@@ -3109,15 +3355,15 @@ impl App {
 
     /// `song:diff` выбранной карты (для сопоставления ответов сети).
     fn chart_key(&self) -> Option<String> {
-        let Mode::Library { selected: Some(si), diff, .. } = &self.mode else {
+        let Mode::Library { selected: Some(e), .. } = &self.mode else {
             return None;
         };
-        let song = self.songs.get(*si)?;
-        let chart = song.charts.get(*diff)?;
+        let song = self.songs.get(e.song)?;
+        let chart = song.charts.get(e.diff)?;
         Some(format!("{}:{}", song.id, chart.diff))
     }
 
-    /// Принять скачанный блоб (DMR1/DMR2; вызывается каждый кадр, как lb_rx).
+    /// Принять скачанный блоб (DMR1/DMR2/DMR3; каждый кадр, как lb_rx).
     fn poll_replay_blob(&mut self) {
         let Some(rx) = &self.rp_blob_rx else { return };
         match rx.try_recv() {
@@ -3130,7 +3376,7 @@ impl App {
                     return;
                 }
                 let current = match &self.mode {
-                    Mode::Library { selected: Some(si), diff, .. } => Some((*si, *diff)),
+                    Mode::Library { selected: Some(e), .. } => Some((e.song, e.diff)),
                     _ => None,
                 };
                 if current != Some((song, diff)) {
@@ -3156,10 +3402,17 @@ impl App {
     fn request_leaderboard(&mut self, song: &str, diff: &str, want_lb: bool) {
         let chart_key = format!("{song}:{diff}");
         // список другой карты не должен висеть, пока грузится этот
+        if !self.lb_key.starts_with(&format!("{chart_key}:")) {
+            self.lb_records.clear();
+            self.lb_sel = 0;
+            self.lb_focus = false;
+            self.lb_detail = None;
+        }
         if self.rp_key != chart_key && !self.rp_records.is_empty() {
             self.rp_records.clear();
-            self.rp_sel = 0;
-            self.rp_focus = false;
+            self.lb_sel = 0;
+            self.lb_focus = false;
+            self.lb_detail = None;
         }
         let key = format!("{chart_key}:{}", u8::from(want_lb));
         if self.lb_key == key || self.lb_pending.as_deref() == Some(key.as_str()) {
@@ -3312,6 +3565,7 @@ impl App {
             song_title: &s.title,
             artist: &s.composer,
             diff: &diff_name,
+            star: crate::stars::star(&self.stars, &s.id, &diff_name),
             play,
             rank,
             is_record: self.result_is_record,
@@ -3436,23 +3690,52 @@ pub fn shot_screen(
     app.fade_x_ui = fx;
     app.fade_y_ui = fy;
     app.headless_size = (width, height);
-    // headless: список реплеев из фикстуры — сеть в шотах не трогаем.
-    // DEEMO_SHOT_REPLAYS=<json с {"replays":[...]}>; DEEMO_SHOT_REPLAY_SEL
-    // выбирает строку, DEEMO_SHOT_REPLAY_FOCUS=1 — состояние фокуса.
+    // headless: публичные реплеи/лидерборд из фикстур — сеть в шотах не трогаем.
+    // DEEMO_SHOT_REPLAYS=<json {"replays":[...]}> — кто имеет реплей;
+    // DEEMO_SHOT_LB=<json {"leaderboard":[...]}> — строки лидерборда;
+    // DEEMO_SHOT_DETAIL=1 открывает детали строки DEEMO_SHOT_DETAIL_IDX (0).
     if let Ok(path) = std::env::var("DEEMO_SHOT_REPLAYS") {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Ok(list) = crate::online::parse_replays(&v) {
-                    app.rp_sel = std::env::var("DEEMO_SHOT_REPLAY_SEL")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0)
-                        .min(list.len().saturating_sub(1));
-                    app.rp_focus = std::env::var("DEEMO_SHOT_REPLAY_FOCUS").is_ok();
                     app.rp_records = list;
                 }
             }
         }
+    }
+    if let Ok(path) = std::env::var("DEEMO_SHOT_LB") {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(list) = v.get("leaderboard") {
+                    if let Ok(recs) = serde_json::from_value::<Vec<crate::online::OnlineRecord>>(list.clone()) {
+                        app.lb_records = recs;
+                        app.lb_online = true;
+                        app.online.state.token = Some("shot".into());
+                        app.online.state.nickname = Some("shot".into());
+                    }
+                }
+            }
+        }
+    }
+    // сортировка/группировка и выбранная сложность — для кадров списка чартов
+    if let Ok(sort) = std::env::var("DEEMO_SHOT_SORT") {
+        app.sort_by = match sort.as_str() {
+            "difficulty" | "difficulty-low" => crate::library::SortBy::Difficulty,
+            "difficulty-high" | "difficulty-desc" => crate::library::SortBy::DifficultyDesc,
+            "artist" => crate::library::SortBy::Artist,
+            "album" => crate::library::SortBy::Album,
+            "length" => crate::library::SortBy::Length,
+            "score" => crate::library::SortBy::Score,
+            _ => crate::library::SortBy::Title,
+        };
+    }
+    if let Ok(group) = std::env::var("DEEMO_SHOT_GROUP") {
+        app.group_by = match group.as_str() {
+            "none" => crate::library::GroupBy::None,
+            "artist" => crate::library::GroupBy::Artist,
+            "length" => crate::library::GroupBy::Length,
+            _ => crate::library::GroupBy::Album,
+        };
     }
     // фиксированная фаза мотива, чтобы скриншоты были воспроизводимы
     app.anim_start = Instant::now() - std::time::Duration::from_secs_f32(5.0);
@@ -3471,11 +3754,22 @@ pub fn shot_screen(
         .ok()
         .and_then(|id| app.songs.iter().position(|s| s.id == id))
         .unwrap_or(sel);
-    let diff = app
-        .songs
-        .get(sel)
-        .map(|s| s.charts.len().saturating_sub(1))
-        .unwrap_or(0);
+    let diff = std::env::var("DEEMO_SHOT_DIFF")
+        .ok()
+        .and_then(|d| {
+            let charts = &app.songs.get(sel)?.charts;
+            d.parse::<usize>()
+                .ok()
+                .filter(|&i| i < charts.len())
+                .or_else(|| charts.iter().position(|c| c.diff == d))
+        })
+        .unwrap_or_else(|| {
+            app.songs
+                .get(sel)
+                .map(|s| s.charts.len().saturating_sub(1))
+                .unwrap_or(0)
+        });
+    let entry = Entry::new(sel, diff);
 
     let mut toast: Option<String> = None;
     match screen {
@@ -3483,13 +3777,10 @@ pub fn shot_screen(
             app.mode = Mode::Library {
                 scroll: 0.0,
                 selected: None,
-                diff,
             };
         }
         "pause" | "play" => {
-            if app.songs.get(sel).is_some() {
-                app.start_play(sel, diff);
-            }
+            app.start_play(sel, diff);
             if let Mode::Play { play, paused, .. } = &mut app.mode {
                 play.score = 874_320;
                 play.combo = 63;
@@ -3525,9 +3816,9 @@ pub fn shot_screen(
                 } else {
                     screens::ResultPp::Ready {
                         pp: 172.6,
-                        total_pp: 2760.6,
-                        pp_tablet: 86.0,
-                        pp_mouse: 86.6,
+                        total_pp: Some(2760.6),
+                        pp_tablet: Some(86.0),
+                        pp_mouse: Some(86.6),
                         record: true,
                     }
                 };
@@ -3658,8 +3949,7 @@ pub fn shot_screen(
             app.mode = Mode::Library {
                 scroll: 0.0,
                 // без чартов выбирать нечего — библиотека рисуется пустой
-                selected: if app.songs.is_empty() { None } else { Some(sel) },
-                diff,
+                selected: if app.songs.is_empty() { None } else { Some(entry) },
             };
             if screen == "library-menu" {
                 app.open_dropdown = Some(0);
@@ -3667,14 +3957,33 @@ pub fn shot_screen(
         }
     }
 
+    // headless: сразу открыть детали плея (кнопка watch — по фикстуре реплеев)
+    if std::env::var("DEEMO_SHOT_DETAIL").is_ok() && !app.lb_records.is_empty() {
+        let idx = std::env::var("DEEMO_SHOT_DETAIL_IDX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(app.lb_records.len() - 1);
+        app.lb_sel = idx;
+        app.lb_focus = true;
+        app.open_play_detail(idx);
+    } else if std::env::var("DEEMO_SHOT_LB_FOCUS").is_ok() && !app.lb_records.is_empty() {
+        app.lb_sel = std::env::var("DEEMO_SHOT_DETAIL_IDX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(app.lb_records.len() - 1);
+        app.lb_focus = true;
+    }
+
     // полноразмерный арт выбранной песни (нужен для аспекта панели)
     let selected_song = match &app.mode {
-        Mode::Library { selected, .. } => *selected,
+        Mode::Library { selected, .. } => selected.map(|e| e.song),
         Mode::Result { song, .. } => Some(*song),
         _ => None,
     };
     if let Some(si) = selected_song {
-        if let Some(path) = app.songs.get(si).and_then(|s| s.cover.clone()) {
+        if let Some(path) = app.songs[si].cover.clone() {
             if let Ok(img) = image::open(&path) {
                 let rgba = img.to_rgba8();
                 let (iw, ih) = rgba.dimensions();
@@ -3707,8 +4016,8 @@ pub fn shot_screen(
             }
             app.bg_field.advance(0.5, t + 1.0);
             app.bg_t_demo = Some(t + 1.0);
-            if let Mode::Library { diff: d, .. } = &mut app.mode {
-                *d = swap;
+            if let Mode::Library { selected: Some(e), .. } = &mut app.mode {
+                e.diff = swap.min(app.songs[e.song].charts.len().saturating_sub(1));
             }
         }
     }
@@ -3716,11 +4025,11 @@ pub fn shot_screen(
     // миниатюры видимых строк
     let scale = crate::theme::ui_scale(width as f32, height as f32);
     let cards = app.card_rects.clone();
-    for (si, r) in cards {
+    for (e, r) in cards {
         if r[1] + r[3] < screens::TOP_H * scale || r[1] > height as f32 {
             continue;
         }
-        if let Some(path) = app.thumb_path(si) {
+        if let Some(path) = app.thumb_path(e.song) {
             if app.covers.contains_key(&path) {
                 continue;
             }
@@ -3741,10 +4050,10 @@ pub fn shot_screen(
     ];
 
     match &app.mode {
-        Mode::Library { selected, diff, .. } => {
+        Mode::Library { selected, .. } => {
             if app.settings.is_none() {
-                let (selected, diff) = (*selected, *diff);
-                app.draw_library(&mut ui, selected, diff);
+                let selected = *selected;
+                app.draw_library(&mut ui, selected);
             }
         }
         Mode::Play { chart, play, song, diff, paused, .. } => {
@@ -3804,6 +4113,20 @@ fn in_rect(x: f32, y: f32, r: [f32; 4]) -> bool {
     x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
 }
 
+/// Следующая строка-чарт при Up/Down. Вынесено из `App::list_key_move`,
+/// чтобы границы списка и старт без выбора были проверяемы тестом.
+pub fn step_entry(entries: &[Entry], cur: Option<Entry>, down: bool) -> Option<Entry> {
+    if entries.is_empty() {
+        return None;
+    }
+    match cur.and_then(|c| entries.iter().position(|&e| e == c)) {
+        Some(i) if down => Some(entries[(i + 1).min(entries.len() - 1)]),
+        Some(i) if !down => Some(entries[i.saturating_sub(1)]),
+        Some(i) => Some(entries[i]),
+        None => Some(entries[0]),
+    }
+}
+
 /// Прокрутка по позиции курсора при перетаскивании ползунка.
 ///
 /// Вынесено из `App::sbar_drag_to` как чистая функция: попадание мыши в
@@ -3860,7 +4183,11 @@ pub fn run() -> Result<()> {
         println!("backend: x11 (XWayland) — drag & drop доступен");
     }
     event_loop.set_control_flow(ControlFlow::Poll);
+    // двойной клик по .deemopack: первый позиционный аргумент ставим тем же
+    // путём, что drag & drop / инбокс; результат — обычный тост библиотеки
+    let args: Vec<String> = std::env::args().collect();
     let mut app = App::new()?;
+    app.startup_pack = pack_path_from_args(&args);
     // если задан DEEMO_CHART — сразу игра (для тестов)
     if let Ok(path) = std::env::var("DEEMO_CHART") {
         if let Ok(chart) = Chart::load(&path) {
@@ -3924,57 +4251,152 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::{queue_toast, tap_edge};
 
-    /// Список реплеев достижим и покидаем только клавиатурой: Tab входит и
+    /// Лидерборд достижим и покидаем только клавиатурой: Tab входит и
     /// выходит, стрелки/Enter работают лишь в фокусе, Esc/Backspace снимают
     /// фокус. Без записей список не перехватывает ни одну клавишу.
     #[test]
-    fn replay_list_is_keyboard_only_and_not_a_trap() {
-        use super::{replay_list_action, ReplayListKey};
+    fn leaderboard_is_keyboard_only_and_not_a_trap() {
+        use super::{leaderboard_action, LeaderboardKey};
         use winit::keyboard::{Key, NamedKey};
         use NamedKey as N;
         let key = |k: NamedKey| Key::Named(k);
 
         assert_eq!(
-            replay_list_action(&key(N::Tab), false, 3),
-            Some(ReplayListKey::ToggleFocus)
+            leaderboard_action(&key(N::Tab), false, 3),
+            Some(LeaderboardKey::ToggleFocus)
         );
         assert_eq!(
-            replay_list_action(&key(N::Tab), true, 3),
-            Some(ReplayListKey::ToggleFocus),
+            leaderboard_action(&key(N::Tab), true, 3),
+            Some(LeaderboardKey::ToggleFocus),
             "Tab leaves the list too"
         );
         assert_eq!(
-            replay_list_action(&key(N::ArrowDown), true, 3),
-            Some(ReplayListKey::Down)
+            leaderboard_action(&key(N::ArrowDown), true, 3),
+            Some(LeaderboardKey::Down)
         );
         assert_eq!(
-            replay_list_action(&key(N::ArrowUp), true, 3),
-            Some(ReplayListKey::Up)
+            leaderboard_action(&key(N::ArrowUp), true, 3),
+            Some(LeaderboardKey::Up)
         );
         assert_eq!(
-            replay_list_action(&key(N::Enter), true, 3),
-            Some(ReplayListKey::Watch)
+            leaderboard_action(&key(N::Enter), true, 3),
+            Some(LeaderboardKey::Open)
         );
         assert_eq!(
-            replay_list_action(&key(N::Space), true, 3),
-            Some(ReplayListKey::Watch)
+            leaderboard_action(&key(N::Escape), true, 3),
+            Some(LeaderboardKey::Back)
         );
         assert_eq!(
-            replay_list_action(&key(N::Escape), true, 3),
-            Some(ReplayListKey::Back)
+            leaderboard_action(&key(N::Backspace), true, 3),
+            Some(LeaderboardKey::Back)
         );
-        assert_eq!(
-            replay_list_action(&key(N::Backspace), true, 3),
-            Some(ReplayListKey::Back)
-        );
-        // вне фокуса стрелки/Enter/Space остаются прежними хоткеями и поиском
-        for k in [N::ArrowUp, N::ArrowDown, N::Enter, N::Space, N::Escape] {
-            assert_eq!(replay_list_action(&key(k), false, 3), None, "{k:?}");
+        // вне фокуса стрелки/Enter остаются прежними хоткеями и поиском
+        for k in [N::ArrowUp, N::ArrowDown, N::Enter, N::Escape] {
+            assert_eq!(leaderboard_action(&key(k), false, 3), None, "{k:?}");
         }
         // пустой список ничего не съедает: Tab/Space работают как раньше
         for k in [N::Tab, N::ArrowUp, N::ArrowDown, N::Enter, N::Space] {
-            assert_eq!(replay_list_action(&key(k), false, 0), None, "{k:?}");
+            assert_eq!(leaderboard_action(&key(k), false, 0), None, "{k:?}");
         }
+    }
+
+    /// Детали открываются по строке и находят реплей строго по нику из
+    /// публичного списка; без реплея кнопка выключена с причиной.
+    #[test]
+    fn play_detail_merges_the_replay_by_nick() {
+        use super::detail_for_record;
+        use crate::online::{OnlineRecord, ReplayEntry};
+        let rec = OnlineRecord {
+            nickname: "piano_kid".into(),
+            song: "12thchance".into(),
+            diff: "hard".into(),
+            score: 987_430,
+            accuracy: 96.56,
+            accuracy_real: Some(88.5),
+            pp: Some(172.6),
+            pp_tablet: Some(86.0),
+            pp_mouse: Some(86.6),
+            hands: true,
+            max_combo: 388,
+            perfect: 412,
+            good: 18,
+            miss: 6,
+            rank: "S".into(),
+            full_combo: false,
+            speed: 4.0,
+            timestamp: 1_794_940_377,
+        };
+        let replay = ReplayEntry {
+            nick: "piano_kid".into(),
+            score: 987_430,
+            pp: Some(172.6),
+            accuracy: 88.5,
+            timestamp: 1_794_940_377,
+            notes: 436,
+        };
+        let d = detail_for_record(&rec, &[replay.clone()], Some(9.6));
+        assert!(d.can_watch());
+        assert_eq!(d.replay.as_ref().map(|r| r.nick.as_str()), Some("piano_kid"));
+        assert_eq!(d.star, Some(9.6));
+        // ряд есть, реплея нет — детали всё равно открываются, watch выключен
+        let d = detail_for_record(&rec, &[], None);
+        assert!(!d.can_watch());
+        assert!(d.watch_reason().contains("Реплея"));
+        // чужой ник не подходит
+        let d = detail_for_record(&rec, &[ReplayEntry { nick: "other".into(), ..replay }], None);
+        assert!(!d.can_watch());
+    }
+
+    /// Up/Down идут по строкам-чартам, включая разные сложности одной песни,
+    /// и не выходят за края.
+    #[test]
+    fn entry_navigation_walks_charts() {
+        use super::step_entry;
+        use crate::library::Entry;
+        let list = [Entry::new(0, 0), Entry::new(0, 1), Entry::new(1, 0)];
+        assert_eq!(step_entry(&list, None, true), Some(list[0]));
+        assert_eq!(step_entry(&list, Some(list[0]), true), Some(list[1]));
+        assert_eq!(step_entry(&list, Some(list[1]), true), Some(list[2]));
+        assert_eq!(step_entry(&list, Some(list[2]), true), Some(list[2]));
+        assert_eq!(step_entry(&list, Some(list[2]), false), Some(list[1]));
+        assert_eq!(step_entry(&list, Some(list[0]), false), Some(list[0]));
+        assert_eq!(step_entry(&[], None, true), None);
+    }
+
+    /// Двойной клик: первый позиционный существующий `.deemopack`/`.zip`
+    /// импортируется, флаги и чужие пути молча игнорируются.
+    #[test]
+    fn pack_argument_is_the_first_existing_pack_file() {
+        use super::pack_path_from_args;
+        let dir = std::env::temp_dir().join(format!("deemo-cli-arg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pack = dir.join("test pack.deemopack");
+        let zip = dir.join("bundle.zip");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&pack, b"x").unwrap();
+        std::fs::write(&zip, b"x").unwrap();
+        std::fs::write(&txt, b"x").unwrap();
+        let args = |tail: &[&str]| {
+            let mut v = vec!["deemo".to_string()];
+            v.extend(tail.iter().map(|s| s.to_string()));
+            v
+        };
+        assert_eq!(pack_path_from_args(&args(&[])), None);
+        assert_eq!(
+            pack_path_from_args(&args(&["--x11", pack.to_str().unwrap()])),
+            Some(pack.clone())
+        );
+        // первый позиционный — не пакет: остальные не ищем
+        assert_eq!(
+            pack_path_from_args(&args(&[txt.to_str().unwrap(), pack.to_str().unwrap()])),
+            None
+        );
+        assert_eq!(pack_path_from_args(&args(&["./does-not-exist.deemopack"])), None);
+        assert_eq!(
+            pack_path_from_args(&args(&[zip.to_str().unwrap()])),
+            Some(zip.clone())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4053,9 +4475,9 @@ mod tests {
             record: true,
             best: 987_430,
             pp: 172.6,
-            total_pp: 2760.6,
-            pp_tablet: 86.0,
-            pp_mouse: 86.6,
+            total_pp: Some(2760.6),
+            pp_tablet: Some(86.0),
+            pp_mouse: Some(86.6),
         };
         let acks = vec![
             UploadedScore { rec: other.clone(), ack: Some(ScoreAck { pp: 4.0, ..ack.clone() }) },
@@ -4063,16 +4485,15 @@ mod tests {
         ];
         let pp = super::result_pp_from_ack(super::ack_for_result(&mine, &acks).expect("ack for my play"));
         assert!(super::ack_for_result(&other, &acks).is_some());
-        // строка на экране: pp, сумма аккаунта и разбивка по рукам
-        assert_eq!(
-            crate::screens::pp_line(pp).as_deref(),
-            Some("PP +172.6  ·  TOTAL 2760.6  ·  PEN 86.0 / MOUSE 86.6")
-        );
-        // пока ответа нет — «PP PENDING», а без входа в аккаунт строки нет
-        assert_eq!(
-            crate::screens::pp_line(crate::screens::ResultPp::Pending).as_deref(),
-            Some("PP PENDING")
-        );
+        // строка на экране: серверные pp, сумма аккаунта и разбивка по рукам
+        let line = crate::screens::pp_line(pp).expect("ready line");
+        for part in ["172.6", "2760.6", "86.0", "86.6"] {
+            assert!(line.contains(part), "server value {part} missing: {line}");
+        }
+        // пока ответа нет — PENDING без числа, а без входа строки нет
+        let pending = crate::screens::pp_line(crate::screens::ResultPp::Pending).expect("pending");
+        assert!(pending.contains("PENDING"));
+        assert!(!pending.chars().any(|c| c.is_ascii_digit()), "{pending}");
         assert_eq!(crate::screens::pp_line(crate::screens::ResultPp::Hidden), None);
         // запись, которой нет в ответах прохода, ничего не обновляет
         let absent = PendingScore::new("http://srv", "tk", serde_json::Map::new());
@@ -4080,7 +4501,7 @@ mod tests {
         // тост загрузки показывает прибавку pp
         assert_eq!(
             super::upload_toast(Some(&ack)),
-            "Score uploaded · +172.6 pp"
+            format!("Score uploaded · {}", crate::pp::ack_tag(172.6))
         );
         assert_eq!(super::upload_toast(None), "Score uploaded");
     }

@@ -100,7 +100,7 @@ pub struct NoteState {
     /// note.time − hit_time: где нота была в момент попадания (для позиции эффекта)
     pub hit_dt: f32,
     /// мировая X указателя в момент судейства; NaN — нота не сбита (мисс).
-    /// Пишется только для попаданий (Perfect/Good), в DMR2 едет как x_note.
+    /// Пишется только для попаданий (Perfect/Good), в DMR3 едет как x_note.
     pub pointer_x: f32,
 }
 
@@ -286,7 +286,7 @@ impl Play {
         let nx = note_x(chart.notes[i].pos);
         self.apply(i, r, t, nx, chart.notes[i].time);
         if r != Judge::Miss {
-            // позиция указателя в момент судейства (для DMR2)
+            // позиция указателя в момент судейства (для DMR3 x_note)
             self.states[i].pointer_x = x;
             self.tap_errors.push(t - chart.notes[i].time);
         }

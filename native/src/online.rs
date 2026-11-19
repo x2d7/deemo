@@ -47,7 +47,25 @@ pub struct OnlineRecord {
     pub song: String,
     pub diff: String,
     pub score: u64,
+    /// Легаси-поле записи: у новых рекордов это настоящая точность попаданий,
+    /// у старых — achievement из счёта. Для отображения есть
+    /// [`OnlineRecord::hit_accuracy`].
     pub accuracy: f32,
+    /// Настоящая точность попаданий (`null` у старых записей). Сервер шлёт
+    /// её отдельно от achievement; старые серверы поля не знают — `None`.
+    #[serde(default)]
+    pub accuracy_real: Option<f32>,
+    /// Серверный pp этого плея. `None` — старый сервер поля не прислал:
+    /// клиент покажет `—` и НИКОГДА не посчитает pp сам.
+    #[serde(default)]
+    pub pp: Option<f32>,
+    #[serde(default)]
+    pub pp_tablet: Option<f32>,
+    #[serde(default)]
+    pub pp_mouse: Option<f32>,
+    /// Была ли у записи разбивка по рукам (для `pp_tablet`/`pp_mouse`).
+    #[serde(default)]
+    pub hands: bool,
     pub max_combo: u32,
     pub perfect: u32,
     pub good: u32,
@@ -57,6 +75,21 @@ pub struct OnlineRecord {
     #[serde(default)]
     pub speed: f32,
     pub timestamp: u64,
+}
+
+impl OnlineRecord {
+    /// Точность попаданий для показа: `accuracy_real`, а на старом сервере —
+    /// единственное, что есть (`accuracy`). Achievement сюда не подмешивается.
+    pub fn hit_accuracy(&self) -> f32 {
+        self.accuracy_real.unwrap_or(self.accuracy)
+    }
+
+    /// Разбивка pp по рукам есть только у записей с `hands` и обоими полями.
+    pub fn has_hand_pp(&self) -> bool {
+        self.hands
+            && self.pp_tablet.is_some_and(|v| v.is_finite())
+            && self.pp_mouse.is_some_and(|v| v.is_finite())
+    }
 }
 
 #[derive(Clone)]
@@ -71,8 +104,9 @@ pub struct ReplayEntry {
     pub nick: String,
     #[serde(default)]
     pub score: u64,
+    /// Серверный pp реплея; `None` — поле отсутствовало (старый сервер).
     #[serde(default)]
-    pub pp: f64,
+    pub pp: Option<f64>,
     #[serde(default)]
     pub accuracy: f64,
     #[serde(default)]
@@ -168,7 +202,7 @@ impl Online {
     /// (achievement rate из счёта с комбо-бонусом). `score` остаётся в теле:
     /// сервер его хранит, хотя сайт для рейтинга берёт accuracy/pp.
     ///
-    /// `replay` — base64 от DMR2 (см. [`crate::replay::dmr2_base64`]). `None` —
+    /// `replay` — base64 от DMR3 (см. [`crate::replay::dmr3_base64`]). `None` —
     /// поля в теле нет совсем (старый сервер его игнорирует в любом случае).
     pub fn score_body(
         song: &str,
@@ -232,7 +266,7 @@ impl Online {
         parse_replays(&v)
     }
 
-    /// Сырой DMR1/DMR2 одного игрока (публично). Пустое тело — ошибка.
+    /// Сырой DMR1/DMR2/DMR3 одного игрока (публично). Пустое тело — ошибка.
     pub fn replay_blob(&self, pack: &str, diff: &str, nick: &str) -> Result<Vec<u8>, String> {
         let url = self.url(&format!(
             "/api/packs/{}/chart/{}/replays/{}",
@@ -402,7 +436,7 @@ mod tests {
         play.states[0].judged = true;
         play.states[0].result = Judge::Perfect;
         play.states[0].hit_time = 1.01;
-        // позиция указателя в момент попадания — уедет в DMR2 x_note
+        // позиция указателя в момент попадания — уедет в DMR3 x_note
         play.states[0].pointer_x = crate::stage::note_x(0.5);
         play.states[1].judged = true;
         play.states[1].result = Judge::Miss;
@@ -411,13 +445,13 @@ mod tests {
         play.counts = [1, 0, 1];
         let hands = Hands::default();
 
-        let b64 = crate::replay::dmr2_base64(&chart, &play, &[]).expect("same lengths");
+        let b64 = crate::replay::dmr3_base64(&chart, &play, &[], &[]).expect("same lengths");
         let body = Online::score_body("song", "hard", &play, 4.0, &hands, Some(&b64));
         let v = serde_json::Value::Object(body);
         assert_eq!(v["replay"], b64.as_str());
         let bytes = crate::replay::base64_decode(&b64).expect("base64");
         let blob = crate::replay::ReplayBlob::decode(&bytes).expect("server-side blob");
-        assert_eq!(blob.format, crate::replay::ReplayFormat::Dmr2);
+        assert_eq!(blob.format, crate::replay::ReplayFormat::Dmr3);
         assert_eq!(blob.notes[0].delta, 10);
         assert_eq!(blob.notes[0].x, 32, "0.5 pos quantized");
         assert_eq!(blob.notes[1].x, crate::replay::DMR1_MISS);
@@ -429,7 +463,7 @@ mod tests {
             links: vec![],
         };
         assert!(
-            crate::replay::dmr2_base64(&longer, &play, &[]).is_none(),
+            crate::replay::dmr3_base64(&longer, &play, &[], &[]).is_none(),
             "length mismatch must not encode"
         );
         let body = Online::score_body("song", "hard", &play, 4.0, &hands, None);
@@ -437,6 +471,45 @@ mod tests {
             body.get("replay").is_none(),
             "no replay key without an encoded blob"
         );
+    }
+
+    /// Лидерборд несёт и легаси-accuracy, и настоящую точность, pp и руки.
+    /// Старый ответ (без новых полей) обязан читаться с дефолтами.
+    #[test]
+    fn leaderboard_parses_hit_accuracy_pp_and_hands() {
+        let v = serde_json::json!({
+            "leaderboard": [
+                {
+                    "nickname": "cyrsia", "song": "ad3abiogenesis", "diff": "hard",
+                    "score": 999192, "accuracy": 99.92, "accuracy_real": 99.19,
+                    "achievement": 99.92, "max_combo": 928,
+                    "perfect": 913, "good": 15, "miss": 0, "rank": "S",
+                    "full_combo": true, "speed": 7.7, "timestamp": 1794940377,
+                    "pp": 86.2475814819336, "pp_tablet": 43.0, "pp_mouse": 43.25,
+                    "hands": true
+                },
+                {
+                    "nickname": "old", "song": "x", "diff": "hard",
+                    "score": 1, "accuracy": 74.9, "max_combo": 2,
+                    "perfect": 1, "good": 0, "miss": 1, "rank": "C",
+                    "full_combo": false, "timestamp": 1
+                }
+            ]
+        });
+        let recs: Vec<OnlineRecord> =
+            serde_json::from_value(v["leaderboard"].clone()).expect("leaderboard");
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].hit_accuracy(), 99.19, "accuracy_real wins");
+        assert!((recs[0].pp.unwrap() - 86.2476).abs() < 1e-3);
+        assert!(recs[0].pp.is_some());
+        assert!(recs[0].has_hand_pp());
+        assert!(recs[0].hands);
+        // старый сервер: только accuracy, без pp/рук
+        assert_eq!(recs[1].accuracy_real, None);
+        assert_eq!(recs[1].hit_accuracy(), 74.9);
+        assert!(recs[1].pp.is_none());
+        assert!(!recs[1].has_hand_pp());
+        assert!(!recs[1].hands);
     }
 
     /// Список реплеев: ровно поля контракта, отсутствующие — дефолтами.
@@ -453,7 +526,7 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].nick, "piano_kid");
         assert_eq!(list[0].score, 987_430);
-        assert!((list[0].pp - 172.6).abs() < 1e-9);
+        assert!((list[0].pp.unwrap() - 172.6).abs() < 1e-9);
         assert_eq!(list[0].notes, 1124);
         assert_eq!(list[1].nick, "mimi");
         assert_eq!(list[1].score, 0);
@@ -469,18 +542,19 @@ mod tests {
         use std::net::TcpListener;
 
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![
                 NoteShot { delta: 5, x: 10 },
                 NoteShot { delta: DMR1_MISS, x: DMR1_MISS },
                 NoteShot { delta: -7, x: -20 },
             ],
-            track: vec![
+            left: vec![
                 TrackPoint { t: 0.0, x: 0.0 },
                 TrackPoint { t: 0.25, x: 1.0 },
             ],
+            right: vec![],
         }
-        .encode_dmr2();
+        .encode();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let served = blob.clone();

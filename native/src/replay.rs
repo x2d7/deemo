@@ -20,15 +20,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Магия DMR1 (старые фикстуры и записи): только тайминг.
 pub const DMR1_MAGIC: [u8; 4] = *b"DMR1";
-/// Магия DMR2: тайминг + позиция указателя в ноте + трек курсора.
+/// Магия DMR2: тайминг + позиция указателя в ноте + один трек (уже не пишем).
 pub const DMR2_MAGIC: [u8; 4] = *b"DMR2";
+/// Магия DMR3: два независимых трека — правая рука (мышь) и левая (перо).
+pub const DMR3_MAGIC: [u8; 4] = *b"DMR3";
 /// Дельта/позиция «ноты не было» (промах, нет указателя).
 pub const DMR1_MISS: i8 = -128;
 /// Предел обычной дельты/координаты.
 const DMR_MAX: i8 = 127;
 /// `dt_ms = 255` — следом идёт u16 LE (порядок как у сервера: dt, u16, x).
 const TRACK_DT_ESCAPE: u8 = 255;
-/// Больше сервер не принимает.
+/// Больше сервер не принимает (на каждый трек).
 pub const TRACK_MAX_SAMPLES: usize = 20_000;
 /// Тот же предел, что у сервера: один блоб не больше 256 КиБ.
 const MAX_BLOB_BYTES: usize = 256 * 1024;
@@ -39,19 +41,25 @@ const MAX_TRACK_MS: u32 = 6 * 60 * 60 * 1000;
 pub const TRACK_INTERVAL: f32 = 0.060;
 /// Сэмпл сверх периода, если указатель ушёл на 0.1 pos от прошлого.
 pub const TRACK_POS_STEP: f32 = 0.1;
-/// Сколько после попадания точка держится ровно на `x_note` (press proof).
+/// Сколько после попадания луч держится ровно на `x_note` (press proof).
 pub const CURSOR_HOLD: f32 = 0.05;
-/// Время жизни кольца нажатия.
-pub const PRESS_RING: f32 = 0.25;
 
 /// Версия разобранного блоба.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayFormat {
     Dmr1,
     Dmr2,
+    Dmr3,
 }
 
-/// Одна нота DMR2: тайминг + позиция указателя в момент судейства.
+/// Какой руке принадлежит луч. Левая — перо/планшет, правая — мышь.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeamSide {
+    Left,
+    Right,
+}
+
+/// Одна нота: тайминг + позиция указателя в момент судейства.
 /// `x` — в координатах сцены (chart pos, -2..2), как в контракте; -128 — мисс.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NoteShot {
@@ -82,12 +90,18 @@ pub struct TrackPoint {
     pub x: f32,
 }
 
-/// Разобранный блоб: нота + (для DMR2) трек. DMR1 трека не имеет.
+/// Разобранный блоб: ноты + два независимых трека.
+///
+/// `DMR1` — без треков, `DMR2` — один трек (исторически указатель; читаем как
+/// левый луч), `DMR3` — правая (мышь) и левая (перо) руки отдельно.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayBlob {
     pub format: ReplayFormat,
     pub notes: Vec<NoteShot>,
-    pub track: Vec<TrackPoint>,
+    /// Левая рука — перо/планшет.
+    pub left: Vec<TrackPoint>,
+    /// Правая рука — мышь.
+    pub right: Vec<TrackPoint>,
 }
 
 impl ReplayBlob {
@@ -96,7 +110,7 @@ impl ReplayBlob {
     }
 
     pub fn has_cursor(&self) -> bool {
-        self.format == ReplayFormat::Dmr2
+        self.format != ReplayFormat::Dmr1 && !(self.left.is_empty() && self.right.is_empty())
     }
 
     /// Мир → chart pos. Контракт клампит x в [-2,2] — это диапазон `Note::pos`,
@@ -110,56 +124,29 @@ impl ReplayBlob {
         }
     }
 
-    /// Разобранный DMR2 (или DMR1) обратно в байты. Пишем всегда DMR2.
-    pub fn encode_dmr2(&self) -> Vec<u8> {
+    /// Блоб всегда пишется как DMR3 (два трека: right, затем left).
+    pub fn encode(&self) -> Vec<u8> {
         let count = self.notes.len().min(u16::MAX as usize);
-        let mut out = Vec::with_capacity(6 + count * 2 + 6 + self.track.len() * 3);
-        out.extend_from_slice(&DMR2_MAGIC);
+        let mut out = Vec::with_capacity(
+            6 + count * 2 + 12 + (self.left.len() + self.right.len()) * 3,
+        );
+        out.extend_from_slice(&DMR3_MAGIC);
         out.extend_from_slice(&(count as u16).to_le_bytes());
         for shot in self.notes.iter().take(count) {
             out.push(shot.delta as u8);
             out.push(shot.x as u8);
         }
-        let points = self
-            .track
-            .len()
-            .min(TRACK_MAX_SAMPLES)
-            .min(u16::MAX as usize);
-        out.extend_from_slice(&(points as u16).to_le_bytes());
-        let first_ms = if points == 0 {
-            0
-        } else {
-            (self.track[0].t.max(0.0) * 1000.0)
-                .round()
-                .min(MAX_TRACK_MS as f32) as u32
-        };
-        out.extend_from_slice(&first_ms.to_le_bytes());
-        let mut prev = first_ms as i64;
-        for (i, p) in self.track.iter().take(points).enumerate() {
-            let t_ms = (p.t.max(0.0) * 1000.0)
-                .round()
-                .max(0.0)
-                .min(MAX_TRACK_MS as f32) as i64;
-            // время монотонно: unsigned dt не должен уходить назад
-            let t_ms = t_ms.max(prev);
-            let dt = if i == 0 {
-                0
-            } else {
-                (t_ms - prev).min(u16::MAX as i64) as u32
-            };
-            if dt >= TRACK_DT_ESCAPE as u32 {
-                out.push(TRACK_DT_ESCAPE);
-                out.extend_from_slice(&(dt as u16).to_le_bytes());
-            } else {
-                out.push(dt as u8);
-            }
-            out.push(pos_to_q(p.x) as u8);
-            prev = t_ms;
-        }
+        encode_track(&mut out, &self.right);
+        encode_track(&mut out, &self.left);
         out
     }
 
-    /// Строгий разбор DMR1 и DMR2. Хвостовые байты, битая длина трека,
+    /// Имя сохранено для старых вызовов; формат на проводе теперь DMR3.
+    pub fn encode_dmr2(&self) -> Vec<u8> {
+        self.encode()
+    }
+
+    /// Строгий разбор DMR1/DMR2/DMR3. Хвостовые байты, битая длина трека,
     /// слишком много сэмплов и время вне 6 часов — ошибка.
     pub fn decode(bytes: &[u8]) -> Result<ReplayBlob, String> {
         if bytes.len() < 6 {
@@ -183,11 +170,13 @@ impl ReplayBlob {
                         x: DMR1_MISS,
                     })
                     .collect(),
-                track: Vec::new(),
+                left: Vec::new(),
+                right: Vec::new(),
             });
         }
-        if &bytes[0..4] != &DMR2_MAGIC {
-            return Err("replay magic is not DMR1/DMR2".into());
+        let dmr2 = &bytes[0..4] == &DMR2_MAGIC;
+        if !dmr2 && &bytes[0..4] != &DMR3_MAGIC {
+            return Err("replay magic is not DMR1/DMR2/DMR3".into());
         }
         let mut pos = 6usize;
         let note_bytes = count
@@ -204,70 +193,123 @@ impl ReplayBlob {
             });
             pos += 2;
         }
-        // track_count + first_t_ms обязаны целиком влезть
-        if bytes.len() < pos + 6 {
-            return Err("replay track header is truncated".into());
-        }
-        let track_count = u16::from_le_bytes(
-            bytes[pos..pos + 2]
-                .try_into()
-                .map_err(|_| "replay track header is truncated".to_string())?,
-        ) as usize;
-        pos += 2;
-        if track_count > TRACK_MAX_SAMPLES {
-            return Err("replay track has too many samples".into());
-        }
-        let first_t = u32::from_le_bytes(
-            bytes[pos..pos + 4]
-                .try_into()
-                .map_err(|_| "replay track header is truncated".to_string())?,
-        );
-        pos += 4;
-        if first_t > MAX_TRACK_MS {
-            return Err("replay track time is out of range".into());
-        }
-        let mut t = first_t;
-        let mut track = Vec::with_capacity(track_count);
-        for _ in 0..track_count {
-            let dt_byte = *bytes
-                .get(pos)
-                .ok_or_else(|| "replay track is truncated".to_string())? as u32;
-            pos += 1;
-            let dt = if dt_byte == TRACK_DT_ESCAPE as u32 {
-                let raw: [u8; 2] = bytes
-                    .get(pos..pos + 2)
-                    .ok_or_else(|| "replay track dt is truncated".to_string())?
-                    .try_into()
-                    .unwrap();
-                pos += 2;
-                u16::from_le_bytes(raw) as u32
-            } else {
-                dt_byte
-            };
-            t = t
-                .checked_add(dt)
-                .ok_or_else(|| "replay track time overflows".to_string())?;
-            if t > MAX_TRACK_MS {
-                return Err("replay track time is out of range".into());
-            }
-            let xb = *bytes
-                .get(pos)
-                .ok_or_else(|| "replay track is truncated".to_string())? as i8;
-            pos += 1;
-            track.push(TrackPoint {
-                t: t as f32 / 1000.0,
-                x: q_to_pos(xb),
-            });
-        }
+        let (left, right) = if dmr2 {
+            // старый DMR2: единственный трек — левый луч
+            (decode_track(bytes, &mut pos)?, Vec::new())
+        } else {
+            // контракт DMR3: сначала правая рука, затем левая
+            let right = decode_track(bytes, &mut pos)?;
+            let left = decode_track(bytes, &mut pos)?;
+            (left, right)
+        };
         if pos != bytes.len() {
             return Err("trailing bytes after the replay".into());
         }
         Ok(ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: if dmr2 { ReplayFormat::Dmr2 } else { ReplayFormat::Dmr3 },
             notes,
-            track,
+            left,
+            right,
         })
     }
+}
+
+/// Записать один трек: `u16 count, u32 first_t_ms, samples[dt,x]`.
+fn encode_track(out: &mut Vec<u8>, track: &[TrackPoint]) {
+    let points = track
+        .len()
+        .min(TRACK_MAX_SAMPLES)
+        .min(u16::MAX as usize);
+    out.extend_from_slice(&(points as u16).to_le_bytes());
+    let first_ms = if points == 0 {
+        0
+    } else {
+        (track[0].t.max(0.0) * 1000.0)
+            .round()
+            .min(MAX_TRACK_MS as f32) as u32
+    };
+    out.extend_from_slice(&first_ms.to_le_bytes());
+    let mut prev = first_ms as i64;
+    for (i, p) in track.iter().take(points).enumerate() {
+        let t_ms = (p.t.max(0.0) * 1000.0)
+            .round()
+            .max(0.0)
+            .min(MAX_TRACK_MS as f32) as i64;
+        // время монотонно: unsigned dt не должен уходить назад
+        let t_ms = t_ms.max(prev);
+        let dt = if i == 0 {
+            0
+        } else {
+            (t_ms - prev).min(u16::MAX as i64) as u32
+        };
+        if dt >= TRACK_DT_ESCAPE as u32 {
+            out.push(TRACK_DT_ESCAPE);
+            out.extend_from_slice(&(dt as u16).to_le_bytes());
+        } else {
+            out.push(dt as u8);
+        }
+        out.push(pos_to_q(p.x) as u8);
+        prev = t_ms;
+    }
+}
+
+/// Прочитать один трек начиная с `pos`.
+fn decode_track(bytes: &[u8], pos: &mut usize) -> Result<Vec<TrackPoint>, String> {
+    if bytes.len() < *pos + 6 {
+        return Err("replay track header is truncated".into());
+    }
+    let track_count = u16::from_le_bytes(
+        bytes[*pos..*pos + 2]
+            .try_into()
+            .map_err(|_| "replay track header is truncated".to_string())?,
+    ) as usize;
+    *pos += 2;
+    if track_count > TRACK_MAX_SAMPLES {
+        return Err("replay track has too many samples".into());
+    }
+    let first_t = u32::from_le_bytes(
+        bytes[*pos..*pos + 4]
+            .try_into()
+            .map_err(|_| "replay track header is truncated".to_string())?,
+    );
+    *pos += 4;
+    if first_t > MAX_TRACK_MS {
+        return Err("replay track time is out of range".into());
+    }
+    let mut t = first_t;
+    let mut track = Vec::with_capacity(track_count);
+    for _ in 0..track_count {
+        let dt_byte = *bytes
+            .get(*pos)
+            .ok_or_else(|| "replay track is truncated".to_string())? as u32;
+        *pos += 1;
+        let dt = if dt_byte == TRACK_DT_ESCAPE as u32 {
+            let raw: [u8; 2] = bytes
+                .get(*pos..*pos + 2)
+                .ok_or_else(|| "replay track dt is truncated".to_string())?
+                .try_into()
+                .unwrap();
+            *pos += 2;
+            u16::from_le_bytes(raw) as u32
+        } else {
+            dt_byte
+        };
+        t = t
+            .checked_add(dt)
+            .ok_or_else(|| "replay track time overflows".to_string())?;
+        if t > MAX_TRACK_MS {
+            return Err("replay track time is out of range".into());
+        }
+        let xb = *bytes
+            .get(*pos)
+            .ok_or_else(|| "replay track is truncated".to_string())? as i8;
+        *pos += 1;
+        track.push(TrackPoint {
+            t: t as f32 / 1000.0,
+            x: q_to_pos(xb),
+        });
+    }
+    Ok(track)
 }
 
 /// Квантование chart pos (-2..2) в i8. -128 не используется: это мисс.
@@ -283,9 +325,14 @@ fn q_to_pos(q: i8) -> f32 {
     (q.max(-127) as f32 / 127.0) * 2.0
 }
 
-/// DMR2 по сыгранному плею. `track` — сэмплы в chart pos. `None`, если чарт
-/// и плей разной длины (например, чарт перезагрузили).
-pub fn dmr2_from_play(chart: &Chart, play: &Play, track: &[TrackPoint]) -> Option<ReplayBlob> {
+/// DMR3 по сыгранному плею. `right` — трек мыши, `left` — трек пера.
+/// `None`, если чарт и плей разной длины (например, чарт перезагрузили).
+pub fn dmr3_from_play(
+    chart: &Chart,
+    play: &Play,
+    right: &[TrackPoint],
+    left: &[TrackPoint],
+) -> Option<ReplayBlob> {
     if chart.notes.len() != play.states.len() || chart.notes.len() > u16::MAX as usize {
         return None;
     }
@@ -316,15 +363,21 @@ pub fn dmr2_from_play(chart: &Chart, play: &Play, track: &[TrackPoint]) -> Optio
         })
         .collect();
     Some(ReplayBlob {
-        format: ReplayFormat::Dmr2,
+        format: ReplayFormat::Dmr3,
         notes,
-        track: track.iter().take(TRACK_MAX_SAMPLES).copied().collect(),
+        left: left.iter().take(TRACK_MAX_SAMPLES).copied().collect(),
+        right: right.iter().take(TRACK_MAX_SAMPLES).copied().collect(),
     })
 }
 
-/// Тело поля `replay` для `POST /api/scores`: base64 от DMR2.
-pub fn dmr2_base64(chart: &Chart, play: &Play, track: &[TrackPoint]) -> Option<String> {
-    dmr2_from_play(chart, play, track).map(|b| base64_encode(&b.encode_dmr2()))
+/// Тело поля `replay` для `POST /api/scores`: base64 от DMR3.
+pub fn dmr3_base64(
+    chart: &Chart,
+    play: &Play,
+    right: &[TrackPoint],
+    left: &[TrackPoint],
+) -> Option<String> {
+    dmr3_from_play(chart, play, right, left).map(|b| base64_encode(&b.encode()))
 }
 
 /// Стандартный base64 (RFC 4648) с `=`. Сервер принимает ровно его.
@@ -397,12 +450,20 @@ pub struct ReplayDriver {
     applied: Vec<bool>,
     order: Vec<usize>,
     times: Vec<f32>,
-    /// Сэмплы в chart pos; мир — через [`crate::stage::note_x`].
-    track: Vec<TrackPoint>,
+    /// Левая (перо) и правая (мышь) дорожки в chart pos.
+    left: Vec<TrackPoint>,
+    right: Vec<TrackPoint>,
     has_cursor: bool,
-    /// Последнее реальное попадание: (hit_time, x_note в chart pos).
-    last_hit: Option<(f32, f32)>,
+    /// Последнее реальное попадание: (hit_time, x_note, какой луч прилип).
+    last_hit: Option<HitSnap>,
     cursor: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HitSnap {
+    t: f32,
+    x: f32,
+    side: BeamSide,
 }
 
 impl ReplayDriver {
@@ -441,7 +502,8 @@ impl ReplayDriver {
             applied: vec![false; chart.notes.len()],
             order,
             times,
-            track: blob.track.clone(),
+            left: blob.left.clone(),
+            right: blob.right.clone(),
             has_cursor: blob.has_cursor(),
             last_hit: None,
             cursor: 0,
@@ -452,9 +514,9 @@ impl ReplayDriver {
         self.has_cursor
     }
 
-    /// Сэмплы трека в chart pos (для хвоста курсора).
-    pub fn track(&self) -> &[TrackPoint] {
-        &self.track
+    /// (левая, правая) дорожки в chart pos.
+    pub fn tracks(&self) -> (&[TrackPoint], &[TrackPoint]) {
+        (&self.left, &self.right)
     }
 
     /// Время последнего срабатывания (для выхода из просмотра с хвостом).
@@ -472,50 +534,27 @@ impl ReplayDriver {
         self.applied.get(i).copied().unwrap_or(false)
     }
 
-    /// Позиция курсора в chart pos: на кадре попадания — ровно `x_note`
-    /// (короткое удержание), между попаданиями — интерполяция трека.
-    pub fn cursor_x(&self, t: f32) -> Option<f32> {
+    /// X луча в chart pos: на кадре попадания прилипший луч стоит ровно на
+    /// `x_note` короткое время, остальные — интерполируются по своему треку.
+    pub fn beam_x(&self, t: f32, side: BeamSide) -> Option<f32> {
         if !self.has_cursor {
             return None;
         }
-        if let Some((ht, hx)) = self.last_hit {
-            if t >= ht && t <= ht + CURSOR_HOLD {
-                return Some(hx);
+        if let Some(snap) = self.last_hit {
+            if snap.side == side && t >= snap.t && t <= snap.t + CURSOR_HOLD {
+                return Some(snap.x);
             }
         }
-        self.track_x(t)
+        let track = match side {
+            BeamSide::Left => &self.left,
+            BeamSide::Right => &self.right,
+        };
+        track_x(track, t)
     }
 
-    /// Нажатие для кольца: (x_note, возраст). None — мисс или кольцо погасло.
-    pub fn press(&self, t: f32) -> Option<(f32, f32)> {
-        if !self.has_cursor {
-            return None;
-        }
-        let (ht, hx) = self.last_hit?;
-        let age = t - ht;
-        if (0.0..=PRESS_RING).contains(&age) {
-            Some((hx, age))
-        } else {
-            None
-        }
-    }
-
-    /// Интерполяция трека; до первого/после последнего — зажим на краях.
-    fn track_x(&self, t: f32) -> Option<f32> {
-        let first = self.track.first()?;
-        let last = self.track.last()?;
-        if t <= first.t {
-            return Some(first.x);
-        }
-        if t >= last.t {
-            return Some(last.x);
-        }
-        let i = self.track.partition_point(|p| p.t <= t);
-        let a = self.track.get(i.checked_sub(1)?)?;
-        let b = self.track.get(i)?;
-        let span = (b.t - a.t).max(1e-6);
-        let f = ((t - a.t) / span).clamp(0.0, 1.0);
-        Some(a.x + (b.x - a.x) * f)
+    /// Какой луч прилип к последнему попаданию (для тестов/отладки).
+    pub fn snapped_side(&self) -> Option<BeamSide> {
+        self.last_hit.map(|h| h.side)
     }
 
     /// Применить все ноты, время которых наступило. Возвращает число
@@ -542,13 +581,51 @@ impl ReplayDriver {
             let result = play.replay_hit(chart, i, hit_time);
             if result != Judge::Miss {
                 if let Some(x) = shot.x_pos() {
-                    self.last_hit = Some((hit_time, x));
+                    // прилипает ближайший к x_note луч; если трек один —
+                    // всегда он, второй продолжает свою дорожку
+                    let l = track_x(&self.left, hit_time);
+                    let r = track_x(&self.right, hit_time);
+                    let side = match (l, r) {
+                        (Some(l), Some(r)) => {
+                            if (l - x).abs() <= (r - x).abs() {
+                                BeamSide::Left
+                            } else {
+                                BeamSide::Right
+                            }
+                        }
+                        (Some(_), None) => BeamSide::Left,
+                        (None, Some(_)) => BeamSide::Right,
+                        (None, None) => BeamSide::Left,
+                    };
+                    self.last_hit = Some(HitSnap {
+                        t: hit_time,
+                        x,
+                        side,
+                    });
                 }
             }
             applied += 1;
         }
         applied
     }
+}
+
+/// Интерполяция одного трека; до первого/после последнего — зажим на краях.
+fn track_x(track: &[TrackPoint], t: f32) -> Option<f32> {
+    let first = track.first()?;
+    let last = track.last()?;
+    if t <= first.t {
+        return Some(first.x);
+    }
+    if t >= last.t {
+        return Some(last.x);
+    }
+    let i = track.partition_point(|p| p.t <= t);
+    let a = track.get(i.checked_sub(1)?)?;
+    let b = track.get(i)?;
+    let span = (b.t - a.t).max(1e-6);
+    let f = ((t - a.t) / span).clamp(0.0, 1.0);
+    Some(a.x + (b.x - a.x) * f)
 }
 
 // источники
@@ -636,6 +713,48 @@ fn kind_name(k: NoteKind) -> &'static str {
     }
 }
 
+/// Мировая X → chart pos для треков.
+fn world_to_chart_pos(x: f32) -> f32 {
+    let scale = note_x(1.0);
+    if x.is_finite() && scale > 0.0 {
+        x / scale
+    } else {
+        0.0
+    }
+}
+
+/// Общее правило сэмплирования одного указателя: старт, ≤80 мс (пишем 60),
+/// |Δx| ≥ 0.1 pos, финал; кап 20 000.
+fn push_track(track: &mut Vec<TrackPoint>, t: f32, pos: f32, force: bool) {
+    let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
+    let Some(last) = track.last().copied() else {
+        if track.len() < TRACK_MAX_SAMPLES {
+            track.push(TrackPoint { t, x: pos });
+        }
+        return;
+    };
+    // время трека монотонно, даже если часы дёрнулись
+    let t = t.max(last.t);
+    if force && (t - last.t).abs() < 1e-4 && (pos - last.x).abs() < 1e-4 {
+        return;
+    }
+    let due = force
+        || t - last.t >= TRACK_INTERVAL
+        || (pos - last.x).abs() >= TRACK_POS_STEP;
+    if !due {
+        return;
+    }
+    if track.len() >= TRACK_MAX_SAMPLES {
+        // «один в конце» должен остаться даже на капе
+        if force {
+            let n = track.len();
+            track[n - 1] = TrackPoint { t, x: pos };
+        }
+        return;
+    }
+    track.push(TrackPoint { t, x: pos });
+}
+
 pub struct Replay {
     events: Vec<Ev>,
     song_id: String,
@@ -648,9 +767,10 @@ pub struct Replay {
     mouse_offset_ms: f32,
     tablet_offset_ms: f32,
     notes: Vec<Value>,
-    /// трек курсора в chart pos: старт, каждые ~60 мс, при сдвиге ≥0.1 pos
-    /// и финальный сэмпл (см. [`Replay::track_sample`]).
-    track: Vec<TrackPoint>,
+    /// независимые треки в chart pos: правая рука (мышь) и левая (перо);
+    /// старт, каждые ~60 мс, при сдвиге ≥0.1 pos и финальный сэмпл.
+    mouse_track: Vec<TrackPoint>,
+    pen_track: Vec<TrackPoint>,
     started: Instant,
 }
 
@@ -686,62 +806,40 @@ impl Replay {
             mouse_offset_ms: 0.0,
             tablet_offset_ms: 0.0,
             notes,
-            track: Vec::new(),
+            mouse_track: Vec::new(),
+            pen_track: Vec::new(),
             started: Instant::now(),
         }
     }
 
-    /// Сэмпл трека во время обычной игры. `x` — мировая X указателя (мышь или
-    /// активное перо); внутри храним chart pos. Старт/конец и пороги —
-    /// 80 мс и 0.1 pos; кап — 20 000 сэмплов.
-    pub fn track_sample(&mut self, t: f32, x: f32) {
-        self.push_track(t, x, false);
+    /// Сэмпл трека мыши (правая рука). `x` — мировая X, внутри chart pos.
+    pub fn track_mouse(&mut self, t: f32, x: f32) {
+        let pos = world_to_chart_pos(x);
+        push_track(&mut self.mouse_track, t, pos, false);
     }
 
-    /// Финальный сэмпл в конце плея (даже если кап уже набран).
-    pub fn track_end(&mut self, t: f32, x: f32) {
-        self.push_track(t, x, true);
+    /// Сэмпл трека пера (левая рука), в том числе при hover.
+    pub fn track_pen(&mut self, t: f32, x: f32) {
+        let pos = world_to_chart_pos(x);
+        push_track(&mut self.pen_track, t, pos, false);
     }
 
-    /// Сэмплы трека в chart pos для DMR2.
-    pub fn track(&self) -> &[TrackPoint] {
-        &self.track
+    /// Финальные сэмплы обеих рук. Перо без свежей позиции продлеваем его
+    /// последним известным x, чтобы дорожка доехала до конца.
+    pub fn track_end(&mut self, t: f32, mouse_x: f32, pen_x: Option<f32>) {
+        let m = world_to_chart_pos(mouse_x);
+        push_track(&mut self.mouse_track, t, m, true);
+        if let Some(px) = pen_x {
+            let p = world_to_chart_pos(px);
+            push_track(&mut self.pen_track, t, p, true);
+        } else if let Some(last) = self.pen_track.last().copied() {
+            push_track(&mut self.pen_track, t, last.x, true);
+        }
     }
 
-    fn push_track(&mut self, t: f32, x: f32, force: bool) {
-        let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
-        let scale = note_x(1.0);
-        let pos = if x.is_finite() && scale > 0.0 {
-            x / scale
-        } else {
-            0.0
-        };
-        let Some(last) = self.track.last().copied() else {
-            if self.track.len() < TRACK_MAX_SAMPLES {
-                self.track.push(TrackPoint { t, x: pos });
-            }
-            return;
-        };
-        // время трека монотонно, даже если часы дёрнулись
-        let t = t.max(last.t);
-        if force && (t - last.t).abs() < 1e-4 && (pos - last.x).abs() < 1e-4 {
-            return;
-        }
-        let due = force
-            || t - last.t >= TRACK_INTERVAL
-            || (pos - last.x).abs() >= TRACK_POS_STEP;
-        if !due {
-            return;
-        }
-        if self.track.len() >= TRACK_MAX_SAMPLES {
-            // «один в конце» должен остаться даже на капе
-            if force {
-                let n = self.track.len();
-                self.track[n - 1] = TrackPoint { t, x: pos };
-            }
-            return;
-        }
-        self.track.push(TrackPoint { t, x: pos });
+    /// (левая, правая) дорожки в chart pos для DMR3.
+    pub fn tracks(&self) -> (&[TrackPoint], &[TrackPoint]) {
+        (&self.pen_track, &self.mouse_track)
     }
 
     /// Раздельные оффсеты ввода (для meta реплея).
@@ -923,23 +1021,26 @@ mod tests {
         play.states[i].pointer_x = pointer_x;
     }
 
-    /// DMR2: дельты, x_note, трек и escape dt > 254 переживают round-trip.
+    /// DMR3: ноты, оба трека и escape dt > 254 переживают round-trip.
     #[test]
-    fn dmr2_round_trip_keeps_notes_and_track() {
+    fn dmr3_round_trip_keeps_notes_and_two_tracks() {
         let chart = chart_with(&[1.0, 2.0, 3.0]);
         let mut play = Play::new(&chart);
         judged_at(&mut play, 0, Judge::Perfect, 1.020, note_x(2.0));
         judged_at(&mut play, 1, Judge::Good, 1.950, note_x(-2.0));
         judged_at(&mut play, 2, Judge::Perfect, 3.100, note_x(0.0));
-        // времена трека берём двоично-точные, x — уже квантованные края,
-        // чтобы сравнение после round-trip было точным
-        let track = vec![
+        // x — уже квантованные края, чтобы сравнение было точным
+        let right = vec![
             TrackPoint { t: 0.5, x: 0.0 },
             TrackPoint { t: 0.75, x: 2.0 },
             TrackPoint { t: 1.5, x: -2.0 },
         ];
-        let blob = dmr2_from_play(&chart, &play, &track).expect("matching lengths");
-        assert_eq!(blob.format, ReplayFormat::Dmr2);
+        let left = vec![
+            TrackPoint { t: 0.5, x: -2.0 },
+            TrackPoint { t: 1.25, x: q_to_pos(64) },
+        ];
+        let blob = dmr3_from_play(&chart, &play, &right, &left).expect("matching lengths");
+        assert_eq!(blob.format, ReplayFormat::Dmr3);
         assert_eq!(
             blob.notes.iter().map(|n| n.delta).collect::<Vec<_>>(),
             vec![20, -50, 100]
@@ -948,60 +1049,93 @@ mod tests {
             blob.notes.iter().map(|n| n.x).collect::<Vec<_>>(),
             vec![127, -127, 0]
         );
-        let bytes = blob.encode_dmr2();
-        assert_eq!(&bytes[0..4], b"DMR2");
+        let bytes = blob.encode();
+        assert_eq!(&bytes[0..4], b"DMR3");
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
         let back = ReplayBlob::decode(&bytes).expect("decode");
-        assert_eq!(back, blob, "notes, x and track round-trip exactly");
+        assert_eq!(back, blob, "notes, x and both tracks round-trip exactly");
         assert_eq!(back.note_count(), chart.notes.len());
         assert!(back.has_cursor());
     }
 
-    /// Точная раскладка DMR2: escape `dt` — это u16 между dt-байтом и x
-    /// (так его читает сервер).
+    /// Точная раскладка DMR3: right-трек, затем left-трек; escape `dt` — это
+    /// u16 между dt-байтом и x (так его читает сервер).
     #[test]
-    fn dmr2_wire_layout_is_exact() {
+    fn dmr3_wire_layout_is_exact() {
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![
                 NoteShot { delta: 5, x: 10 },
                 NoteShot { delta: DMR1_MISS, x: DMR1_MISS },
             ],
-            track: vec![
+            right: vec![
                 TrackPoint { t: 1.0, x: 0.0 },
                 TrackPoint { t: 1.316, x: q_to_pos(5) },
                 TrackPoint { t: 1.326, x: q_to_pos(-5) },
             ],
+            left: vec![
+                TrackPoint { t: 1.2, x: q_to_pos(3) },
+                TrackPoint { t: 1.207, x: q_to_pos(-3) },
+            ],
         };
         let expected: Vec<u8> = vec![
-            b'D', b'M', b'R', b'2', 2, 0, // magic + note_count
+            b'D', b'M', b'R', b'3', 2, 0, // magic + note_count
             5, 10, // note 0: delta 5, x 10
             0x80, 0x80, // note 1: miss / no x
-            3, 0, // track_count
+            // right
+            3, 0, // right_count
             0xE8, 0x03, 0x00, 0x00, // first_t_ms = 1000
             0, 0, // dt=0, x=0
             255, 0x3C, 0x01, 5, // dt=255+316, x=5
             10, 0xFB, // dt=10, x=-5
+            // left
+            2, 0, // left_count
+            0xB0, 0x04, 0x00, 0x00, // first_t_ms = 1200
+            0, 3, // dt=0, x=3
+            7, 0xFD, // dt=7, x=-3
         ];
-        assert_eq!(blob.encode_dmr2(), expected);
+        assert_eq!(blob.encode(), expected);
         let back = ReplayBlob::decode(&expected).expect("decode exact layout");
         assert_eq!(back.notes, blob.notes);
-        assert_eq!(back.track.len(), 3);
-        assert!((back.track[1].t - 1.316).abs() < 1e-4);
-        assert_eq!(back.track[1].x, q_to_pos(5));
-        assert_eq!(back.track[2].x, q_to_pos(-5));
+        assert_eq!(back.right.len(), 3);
+        assert_eq!(back.left.len(), 2);
+        assert!((back.right[1].t - 1.316).abs() < 1e-4);
+        assert_eq!(back.right[1].x, q_to_pos(5));
+        assert_eq!(back.right[2].x, q_to_pos(-5));
+        assert_eq!(back.left[1].x, q_to_pos(-3));
+    }
+
+    /// Старый DMR2 (один трек) читается и становится левым лучом.
+    #[test]
+    fn dmr2_single_track_decodes_as_the_left_beam() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DMR2");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 10, 0x40]);
+        let blob = ReplayBlob::decode(&bytes).expect("old DMR2");
+        assert_eq!(blob.format, ReplayFormat::Dmr2);
+        assert_eq!(blob.left.len(), 2);
+        assert!(blob.right.is_empty());
+        let chart = chart_with(&[1.0]);
+        let driver = ReplayDriver::new(&chart, &blob, "old").unwrap();
+        assert_eq!(driver.beam_x(0.0, BeamSide::Left), Some(0.0));
+        assert_eq!(driver.beam_x(10.0, BeamSide::Left), Some(q_to_pos(0x40)));
+        assert_eq!(driver.beam_x(0.0, BeamSide::Right), None);
     }
 
     /// Хит с указателем за пределами сцены зажимается в [-2,2] pos; мисс
-    /// пишет -128 в оба поля. DMR1 по-прежнему читается, но без курсора.
+    /// пишет -128 в оба поля. DMR1 по-прежнему читается, но без лучей.
     #[test]
-    fn dmr2_clamps_x_and_marks_misses_dmr1_still_decodes() {
+    fn dmr3_clamps_x_and_marks_misses_dmr1_still_decodes() {
         let chart = chart_with(&[1.0, 2.0, 3.0]);
         let mut play = Play::new(&chart);
         judged_at(&mut play, 0, Judge::Perfect, 1.0, 100.0);
         judged_at(&mut play, 1, Judge::Perfect, 2.0, -100.0);
         judged(&mut play, 2, Judge::Miss, 3.3);
-        let blob = dmr2_from_play(&chart, &play, &[]).unwrap();
+        let blob = dmr3_from_play(&chart, &play, &[], &[]).unwrap();
         assert_eq!(blob.notes[0].x, 127);
         assert_eq!(blob.notes[1].x, -127);
         assert_eq!(blob.notes[2].delta, DMR1_MISS);
@@ -1017,11 +1151,11 @@ mod tests {
         no_ptr.states[0].result = Judge::Perfect;
         no_ptr.states[0].hit_time = 1.0;
         no_ptr.states[0].pointer_x = f32::NAN;
-        let fallback = dmr2_from_play(&chart, &no_ptr, &[]).unwrap();
+        let fallback = dmr3_from_play(&chart, &no_ptr, &[], &[]).unwrap();
         assert_eq!(fallback.notes[0].x, 0, "x ноты (pos 0)");
         assert_ne!(fallback.notes[0].x, DMR1_MISS);
 
-        // DMR1: длина 6 + note_count, x нет, трека нет
+        // DMR1: длина 6 + note_count, x нет, треков нет
         let mut v1 = Vec::new();
         v1.extend_from_slice(b"DMR1");
         v1.extend_from_slice(&3u16.to_le_bytes());
@@ -1029,7 +1163,7 @@ mod tests {
         let old = ReplayBlob::decode(&v1).expect("old DMR1 fixture");
         assert_eq!(old.format, ReplayFormat::Dmr1);
         assert!(!old.has_cursor());
-        assert!(old.track.is_empty());
+        assert!(old.left.is_empty() && old.right.is_empty());
         assert_eq!(
             old.notes.iter().map(|n| n.delta).collect::<Vec<_>>(),
             vec![5, -5, DMR1_MISS]
@@ -1037,42 +1171,56 @@ mod tests {
         assert!(old.notes.iter().all(|n| n.x == DMR1_MISS));
     }
 
-    /// DMR2: битые длины/хвосты и слишком длинный трек отвергаются.
+    /// DMR3: битые длины/хвосты и слишком длинный трек отвергаются;
+    /// note-count мисматч ловит драйвер.
     #[test]
-    fn dmr2_rejects_bad_lengths_and_oversized_tracks() {
+    fn dmr3_rejects_bad_lengths_and_oversized_tracks() {
         let good = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![NoteShot { delta: 5, x: 10 }],
-            track: vec![
+            right: vec![
                 TrackPoint { t: 1.0, x: 0.0 },
                 TrackPoint { t: 1.5, x: 1.0 },
             ],
+            left: vec![TrackPoint { t: 1.0, x: -1.0 }],
         }
-        .encode_dmr2();
+        .encode();
         let mut wrong_count = good.clone();
         wrong_count[4] = 2; // note_count = 2, table is still 1
         assert!(ReplayBlob::decode(&wrong_count).is_err());
         assert!(ReplayBlob::decode(&good[..good.len() - 1]).is_err());
-        // обрыв ровно на конце таблицы нот и внутри track-заголовка
         assert!(ReplayBlob::decode(&good[..8]).is_err());
         assert!(ReplayBlob::decode(&good[..10]).is_err());
         let mut extra = good.clone();
         extra.push(0);
         assert!(ReplayBlob::decode(&extra).is_err());
         assert!(ReplayBlob::decode(b"DMR0\x00\x00").is_err());
-        assert!(ReplayBlob::decode(b"DMR2").is_err());
-        // track_count 20001 без данных: ошибка до чтения сэмплов
+        assert!(ReplayBlob::decode(b"DMR3").is_err());
+        // right_count 20001 без данных: ошибка до чтения сэмплов
         let mut huge = Vec::new();
-        huge.extend_from_slice(b"DMR2");
+        huge.extend_from_slice(b"DMR3");
         huge.extend_from_slice(&0u16.to_le_bytes());
         huge.extend_from_slice(&(TRACK_MAX_SAMPLES as u16 + 1).to_le_bytes());
         huge.extend_from_slice(&0u32.to_le_bytes());
         assert!(ReplayBlob::decode(&huge).is_err());
+        // слишком длинные треки не проходят и при кодировании (кап 20k)
+        let long: Vec<TrackPoint> = (0..TRACK_MAX_SAMPLES + 50)
+            .map(|i| TrackPoint { t: i as f32 * 0.1, x: 0.0 })
+            .collect();
+        let blob = ReplayBlob {
+            format: ReplayFormat::Dmr3,
+            notes: vec![],
+            right: long.clone(),
+            left: long,
+        };
+        let back = ReplayBlob::decode(&blob.encode()).unwrap();
+        assert_eq!(back.right.len(), TRACK_MAX_SAMPLES);
+        assert_eq!(back.left.len(), TRACK_MAX_SAMPLES);
     }
 
-    /// DMR1-плей в просмотре не получает курсор/кольцо — только старый бейдж.
+    /// DMR1-плей в просмотре не получает лучей — только старый бейдж.
     #[test]
-    fn dmr1_play_has_no_cursor() {
+    fn dmr1_play_has_no_beams() {
         let chart = chart_with(&[1.0]);
         let mut v1 = Vec::new();
         v1.extend_from_slice(b"DMR1");
@@ -1084,113 +1232,145 @@ mod tests {
         driver.apply(&mut play, &chart, 1.0);
         assert_eq!(play.states[0].result, Judge::Perfect);
         assert!(!driver.has_cursor());
-        assert_eq!(driver.cursor_x(1.0), None);
-        assert_eq!(driver.press(1.0), None);
-        assert!(driver.track().is_empty());
+        assert_eq!(driver.beam_x(1.0, BeamSide::Left), None);
+        assert_eq!(driver.beam_x(1.0, BeamSide::Right), None);
+        let (l, r) = driver.tracks();
+        assert!(l.is_empty() && r.is_empty());
     }
 
-    /// При попадании курсор на кадре удара — ровно x_note (press proof);
-    /// кольцо живёт PRESS_RING, на миссе его нет.
+    /// На кадре попадания прилипает ближайший луч (right к x_note), второй
+    /// продолжает свой трек; на миссе ничего не прилипает.
     #[test]
-    fn replay_cursor_is_exact_on_the_hit_frame_and_ring_fades() {
+    fn replay_beams_snap_the_nearest_track_on_the_hit_frame() {
         let chart = chart_with(&[1.0, 2.0]);
         let x_hit = 1.5;
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![
                 NoteShot { delta: 0, x: pos_to_q(x_hit) },
                 NoteShot { delta: DMR1_MISS, x: DMR1_MISS },
             ],
-            track: vec![
+            // right проходит около x_hit, left стоит далеко слева
+            right: vec![
                 TrackPoint { t: 0.5, x: 0.0 },
                 TrackPoint { t: 0.75, x: 2.0 },
                 TrackPoint { t: 2.5, x: -2.0 },
+            ],
+            left: vec![
+                TrackPoint { t: 0.0, x: -2.0 },
+                TrackPoint { t: 3.0, x: -2.0 },
             ],
         };
         let mut driver = ReplayDriver::new(&chart, &blob, "kid").unwrap();
         let mut play = Play::new(&chart);
         driver.apply(&mut play, &chart, 1.0);
         let want = q_to_pos(pos_to_q(x_hit));
-        assert_eq!(driver.cursor_x(1.0), Some(want), "hit frame is exact");
-        assert_eq!(driver.press(1.0).map(|(x, _)| x), Some(want));
-        // кольцо ещё живёт в конце окна и гаснет после него
-        assert!(driver.press(1.0 + PRESS_RING - 0.01).is_some());
-        assert_eq!(driver.press(1.0 + PRESS_RING + 0.01), None);
-        // вне короткого удержания курсор уходит на трек (не x_note)
-        assert_ne!(driver.cursor_x(1.1), Some(want));
-        // мисс не двигает last_hit: к 2.3 кольцо давно погасло
+        assert_eq!(driver.snapped_side(), Some(BeamSide::Right));
+        assert_eq!(driver.beam_x(1.0, BeamSide::Right), Some(want), "hit is exact");
+        assert_eq!(driver.beam_x(1.0, BeamSide::Left), Some(-2.0), "left keeps its track");
+        // после удержания right возвращается на интерполяцию 2 → −2
+        let t_after = 1.0 + CURSOR_HOLD + 0.01;
+        let want_after = 2.0 - 4.0 * ((t_after - 0.75) / 1.75);
+        assert!((driver.beam_x(t_after, BeamSide::Right).unwrap() - want_after).abs() < 1e-5);
+        // мисс не двигает last_hit: к 2.3 прилипание давно кончилось
         driver.apply(&mut play, &chart, 2.3);
         assert_eq!(play.states[1].result, Judge::Miss);
-        assert_eq!(driver.press(2.3), None);
+        assert_eq!(driver.snapped_side(), Some(BeamSide::Right));
+        let after = driver.beam_x(2.3, BeamSide::Right).unwrap();
+        assert!((after - -1.5428).abs() < 0.02, "right follows track: {after}");
+        assert_eq!(driver.beam_x(2.3, BeamSide::Left), Some(-2.0));
     }
 
-    /// Конец энкодера: hit → x_note в DMR2; после decode драйвер возвращает
-    /// ту же позицию на кадре попадания (сквозной тест записи).
+    /// Сквозной тест записи: hit → x_note в DMR3; после decode драйвер
+    /// прилипает правым лучом к той же позиции.
     #[test]
-    fn dmr2_encode_then_play_reports_the_same_hit_x() {
+    fn dmr3_encode_then_play_reports_the_same_hit_x() {
         let chart = chart_with(&[1.0]);
         let mut play = Play::new(&chart);
         judged_at(&mut play, 0, Judge::Perfect, 1.0, note_x(2.0));
-        let blob = dmr2_from_play(&chart, &play, &[TrackPoint { t: 0.0, x: 0.0 }]).unwrap();
-        let back = ReplayBlob::decode(&blob.encode_dmr2()).unwrap();
+        let blob = dmr3_from_play(
+            &chart,
+            &play,
+            &[TrackPoint { t: 0.0, x: 0.0 }],
+            &[TrackPoint { t: 0.0, x: -2.0 }],
+        )
+        .unwrap();
+        let back = ReplayBlob::decode(&blob.encode()).unwrap();
         let mut driver = ReplayDriver::new(&chart, &back, "kid").unwrap();
         let mut replay_play = Play::new(&chart);
         driver.apply(&mut replay_play, &chart, 1.0);
-        assert_eq!(driver.cursor_x(1.0), Some(2.0));
+        assert_eq!(driver.beam_x(1.0, BeamSide::Right), Some(2.0));
+        assert_eq!(driver.beam_x(1.0, BeamSide::Left), Some(-2.0));
     }
 
-    /// Трек интерполируется между сэмплами и зажимается на краях.
+    /// Оба трека интерполируются независимо и зажимаются на краях.
     #[test]
-    fn cursor_interpolates_the_track_and_clamps_at_the_ends() {
+    fn beams_interpolate_each_track_and_clamp_at_the_ends() {
         let chart = Chart::empty();
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![],
-            track: vec![
+            left: vec![
                 TrackPoint { t: 0.5, x: 0.0 },
                 TrackPoint { t: 0.8, x: 2.0 },
                 TrackPoint { t: 1.1, x: -2.0 },
             ],
+            right: vec![
+                TrackPoint { t: 0.0, x: -1.0 },
+                TrackPoint { t: 2.0, x: 1.0 },
+            ],
         };
         let driver = ReplayDriver::new(&chart, &blob, "kid").unwrap();
-        assert_eq!(driver.cursor_x(0.0), Some(0.0), "clamped before the start");
-        assert!((driver.cursor_x(0.65).unwrap() - 1.0).abs() < 1e-6);
-        assert!((driver.cursor_x(0.95).unwrap() - 0.0).abs() < 1e-6);
-        assert_eq!(driver.cursor_x(9.0), Some(-2.0), "clamped after the end");
+        assert_eq!(driver.beam_x(0.0, BeamSide::Left), Some(0.0), "left clamps");
+        assert!((driver.beam_x(0.65, BeamSide::Left).unwrap() - 1.0).abs() < 1e-6);
+        assert!((driver.beam_x(0.95, BeamSide::Left).unwrap() - 0.0).abs() < 1e-6);
+        assert_eq!(driver.beam_x(9.0, BeamSide::Left), Some(-2.0));
+        assert!((driver.beam_x(1.0, BeamSide::Right).unwrap() - 0.0).abs() < 1e-6);
+        assert_eq!(driver.beam_x(9.0, BeamSide::Right), Some(1.0));
     }
 
-    /// Сэмплирование: старт, ≤80 мс (мы берём 60), сдвиг ≥0.1 pos, конец и кап.
+    /// Сэмплирование каждого указателя отдельно: старт, 60 мс, сдвиг ≥0.1,
+    /// конец и кап на КАЖДЫЙ трек.
     #[test]
-    fn track_sampling_obeys_the_interval_step_and_cap() {
+    fn track_sampling_is_independent_per_pointer() {
         let chart = Chart::empty();
         let mut r = Replay::new("s", "hard", "T", &chart, 6.5, 0.0, 1.0, 0.75);
-        // отрицательный lead-in зажимается в 0; это стартовый сэмпл
-        r.track_sample(-2.0, 0.0);
-        assert_eq!(r.track().len(), 1);
-        assert_eq!(r.track()[0].t, 0.0);
-        r.track_sample(0.03, 0.0);
-        assert_eq!(r.track().len(), 1, "period not reached");
-        r.track_sample(0.061, 0.0);
-        assert_eq!(r.track().len(), 2, "next regular sample");
-        // скачок указателя на 0.2 pos — сэмпл вне периода
-        r.track_sample(0.062, note_x(0.2));
-        assert_eq!(r.track().len(), 3);
-        assert!((r.track()[2].x - 0.2).abs() < 1e-5, "stored in chart pos");
-        r.track_sample(0.063, note_x(0.2));
-        assert_eq!(r.track().len(), 3, "small move is suppressed");
-        // конец ставится принудительно
-        r.track_end(0.064, note_x(0.2));
-        assert_eq!(r.track().len(), 4);
+        // отрицательный lead-in зажимается в 0; это стартовые сэмплы
+        r.track_mouse(-2.0, 0.0);
+        r.track_pen(-2.0, note_x(-1.0));
+        let (left, right) = r.tracks();
+        assert_eq!(right.len(), 1, "mouse start");
+        assert_eq!(left.len(), 1, "pen start");
+        assert_eq!(right[0].t, 0.0);
+        assert!((left[0].x + 1.0).abs() < 1e-5);
+        r.track_mouse(0.03, 0.0);
+        assert_eq!(r.tracks().1.len(), 1, "period not reached");
+        r.track_mouse(0.061, 0.0);
+        assert_eq!(r.tracks().1.len(), 2, "next regular mouse sample");
+        r.track_mouse(0.062, note_x(0.2));
+        assert_eq!(r.tracks().1.len(), 3);
+        assert!((r.tracks().1[2].x - 0.2).abs() < 1e-5, "mouse pos");
+        // перо двигается независимо и не трогает мышь
+        r.track_pen(0.061, note_x(0.5));
+        assert_eq!(r.tracks().0.len(), 2);
+        assert!((r.tracks().0[1].x - 0.5).abs() < 1e-5);
+        assert_eq!(r.tracks().1.len(), 3, "pen does not touch mouse");
+        // конец ставится принудительно в оба трека
+        r.track_end(0.064, note_x(0.2), Some(note_x(0.5)));
+        assert_eq!(r.tracks().1.len(), 4);
+        assert_eq!(r.tracks().0.len(), 3);
         // кап: больше 20 000 не пускаем, но конец всё равно обновляет последний
         let mut big = Replay::new("s", "hard", "T", &chart, 6.5, 0.0, 1.0, 0.75);
         for i in 0..TRACK_MAX_SAMPLES + 100 {
-            big.track_sample(i as f32 * 0.1, note_x((i % 2) as f32));
+            big.track_mouse(i as f32 * 0.1, note_x((i % 2) as f32));
         }
-        assert_eq!(big.track().len(), TRACK_MAX_SAMPLES);
-        let last_before = *big.track().last().unwrap();
-        big.track_end(30_000.0, note_x(1.0));
-        assert_eq!(big.track().len(), TRACK_MAX_SAMPLES, "cap is hard");
-        assert_ne!(big.track().last().unwrap().t, last_before.t, "end still lands");
+        assert_eq!(big.tracks().1.len(), TRACK_MAX_SAMPLES);
+        assert!(big.tracks().0.is_empty());
+        let last_before = *big.tracks().1.last().unwrap();
+        big.track_end(30_000.0, note_x(1.0), Some(note_x(-1.0)));
+        assert_eq!(big.tracks().1.len(), TRACK_MAX_SAMPLES, "cap is hard");
+        assert_ne!(big.tracks().1.last().unwrap().t, last_before.t, "end still lands");
+        assert_eq!(big.tracks().0.len(), 1, "pen gets its own end sample");
     }
 
     /// Драйвер идёт по фактическому времени срабатывания, а не по индексам:
@@ -1199,13 +1379,14 @@ mod tests {
     fn replay_driver_applies_notes_in_time_order_exactly_once() {
         let chart = chart_with(&[1.0, 1.05, 2.0]);
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![
                 NoteShot { delta: 127, x: 0 },
                 NoteShot { delta: -100, x: 0 },
                 NoteShot { delta: DMR1_MISS, x: DMR1_MISS },
             ],
-            track: vec![],
+            left: vec![],
+            right: vec![],
         };
         let mut driver = ReplayDriver::new(&chart, &blob, "piano_kid").expect("driver");
         let mut play = Play::new(&chart);
@@ -1239,18 +1420,20 @@ mod tests {
     fn replay_driver_rejects_a_note_count_mismatch() {
         let chart = chart_with(&[1.0, 2.0]);
         let blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![NoteShot { delta: 0, x: 0 }],
-            track: vec![],
+            left: vec![],
+            right: vec![],
         };
         let err = ReplayDriver::new(&chart, &blob, "x").unwrap_err();
         assert!(err.contains("2"), "error mentions the chart size: {err}");
         // и заодно базовый случай, когда у чарта нет нот
         let empty = chart_with(&[]);
         let empty_blob = ReplayBlob {
-            format: ReplayFormat::Dmr2,
+            format: ReplayFormat::Dmr3,
             notes: vec![],
-            track: vec![],
+            left: vec![],
+            right: vec![],
         };
         assert!(ReplayDriver::new(&empty, &empty_blob, "x").is_ok());
     }
