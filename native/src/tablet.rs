@@ -173,6 +173,12 @@ pub fn parse_report(kind: &str, b: &[u8]) -> Option<(i32, i32, bool)> {
             if b.len() < off + 8 {
                 return None;
             }
+            // UCLogic: 0xC0 — out of range, bit 6 — express keys. Neither is a
+            // pen sample; parsing them as X/pressure would jump the cursor.
+            let flags = b[off + 1];
+            if flags == 0xc0 || flags & 0x40 != 0 {
+                return None;
+            }
             let x = u16le(b, off + 2);
             let p = u16le(b, off + 6);
             Some((x, p, p == 0))
