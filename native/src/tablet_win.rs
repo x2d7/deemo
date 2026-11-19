@@ -11,8 +11,7 @@
 
 use crate::hid_desc::DigitizerLayout;
 use crate::tablet::{
-    self, ProbeLog, Sink, Tablets, GAOMON_PID, GAOMON_PRESS_THRESHOLD, GAOMON_VID, PARBLO_PID,
-    PARBLO_VID,
+    self, ProbeLog, Sink, Tablets, GAOMON_PRESS_THRESHOLD, GAOMON_VID, PARBLO_PID, PARBLO_VID,
 };
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::ffi::CStr;
@@ -23,26 +22,28 @@ use std::time::{Duration, Instant};
 struct Target {
     kind: &'static str,
     vid: u16,
-    pid: u16,
+    /// `None` — любая модель этого вендора: у Gaomon PID зависит от прошивки
+    /// (006d, 006f, ...), а vendor-отчёты у них одинаковые.
+    pid: Option<u16>,
 }
 
 const TARGETS: [Target; 2] = [
     Target {
         kind: "gaomon",
         vid: GAOMON_VID,
-        pid: GAOMON_PID,
+        pid: None,
     },
     Target {
         kind: "parblo",
         vid: PARBLO_VID,
-        pid: PARBLO_PID,
+        pid: Some(PARBLO_PID),
     },
 ];
 
 fn target_kind(vid: u16, pid: u16) -> Option<&'static str> {
     TARGETS
         .iter()
-        .find(|t| t.vid == vid && t.pid == pid)
+        .find(|t| t.vid == vid && t.pid.map_or(true, |p| p == pid))
         .map(|t| t.kind)
 }
 
@@ -72,13 +73,21 @@ pub(crate) fn spawn_tablets(tablets: &Tablets, zoom: f32, p_threshold: i32) {
     for target in TARGETS {
         let devices: Vec<DeviceInfo> = api
             .device_list()
-            .filter(|d| d.vendor_id() == target.vid && d.product_id() == target.pid)
+            .filter(|d| {
+                d.vendor_id() == target.vid
+                    && target.pid.map_or(true, |p| d.product_id() == p)
+            })
             .cloned()
             .collect();
         if devices.is_empty() {
             println!(
-                "tablet: {} {:04x}:{:04x} not found",
-                target.kind, target.vid, target.pid
+                "tablet: {} {:04x}:{} not found",
+                target.kind,
+                target.vid,
+                target
+                    .pid
+                    .map(|p| format!("{p:04x}"))
+                    .unwrap_or_else(|| "*".into())
             );
             continue;
         }
@@ -92,6 +101,10 @@ pub(crate) fn spawn_tablets(tablets: &Tablets, zoom: f32, p_threshold: i32) {
         // Сначала собрать дескрипторы и раскладки, затем открывать.
         let mut plans: Vec<(DeviceInfo, Option<DigitizerLayout>)> = Vec::new();
         for info in devices {
+            // Клавиатурные/мышиные коллекции того же устройства не читаем.
+            if info.usage_page() == 0x0001 && matches!(info.usage(), 0x02 | 0x06) {
+                continue;
+            }
             let (desc, source) = descriptor_of(&info, &api);
             let layout = DigitizerLayout::parse(&desc);
             println!(
@@ -150,11 +163,17 @@ pub(crate) fn spawn_tablets(tablets: &Tablets, zoom: f32, p_threshold: i32) {
                 Ok(dev) => dev,
                 Err(e) => {
                     println!(
-                        "tablet: {} {:04x}:{:04x} open failed (interface {}): {e}",
+                        "tablet: {} {:04x}:{:04x} open failed (interface {}, usage_page 0x{:04x}): {e}{}",
                         target.kind,
                         info.vendor_id(),
                         info.product_id(),
                         info.interface_number(),
+                        info.usage_page(),
+                        if digitizer_usage {
+                            " — digitizer is owned by Windows Ink; the vendor collection is used instead"
+                        } else {
+                            ""
+                        },
                     );
                     continue;
                 }
