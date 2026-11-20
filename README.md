@@ -2,7 +2,8 @@
 
 A Deemo-style rhythm game for PC (Linux, Windows) built around a chart server:
 
-- **Charts**: upload and download packs, public profiles, per-chart leaderboards.
+- **Charts**: upload and download packs, browse public profiles, and compete on
+  leaderboards.
 - **Stars and pp**: every chart is rated from its content, and every play earns
   pp; the profile sums the best plays.
 - **Two independent cursors**: one per hand, each judged separately.
