@@ -20,6 +20,13 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root/native"
 
+# Keep build-machine paths out of the binary (panic locations, source maps):
+# a release must not leak /home/<user>/....
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$root=/build/deemo"
+if [ -n "${HOME:-}" ]; then
+    export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$HOME=/build"
+fi
+
 echo "rustc: $(rustc --version)"
 echo "cargo: $(cargo --version)"
 echo "building into $root/native/target/release"
