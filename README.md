@@ -17,6 +17,15 @@ device; the mouse drives the other. Tablet support is at an early stage: only a
 few models are mapped so far, and the list keeps growing — see
 [TABLETS.md](TABLETS.md).
 
+On Linux, if the pen is not detected, run once:
+
+```sh
+sudo scripts/install-udev.sh
+```
+
+and replug the tablet. The script grants access to the raw HID device and tells
+the compositor to ignore the pen, so it moves only the game cursor.
+
 ![song select](screenshots/main.png)
 
 ## Install from release
