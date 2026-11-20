@@ -79,19 +79,40 @@ fn desktop_exec(exe: &Path) -> String {
     }
 }
 
+/// Directory that contains the game's `data/`. In a release it is next to
+/// the executable; in a `cargo build` tree it is the working directory the
+/// game is started from (otherwise `Path=` would point at `target/release`,
+/// which has no assets).
+#[cfg(target_os = "linux")]
+fn game_root(exe: &Path) -> PathBuf {
+    let exe_dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let has_game_data = |dir: &Path| dir.join("data/library.json").is_file();
+    if has_game_data(exe_dir) {
+        return exe_dir.to_path_buf();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if has_game_data(&cwd) {
+            return cwd;
+        }
+    }
+    exe_dir.to_path_buf()
+}
+
 #[cfg(target_os = "linux")]
 fn desktop_file(exe: &Path) -> String {
-    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    let path = dir.to_string_lossy();
+    let root = game_root(exe);
+    let path = root.to_string_lossy();
     let path = if path.chars().any(char::is_whitespace) {
         format!("\"{path}\"")
     } else {
         path.into_owned()
     };
+    let icon = root.join("data/icon.png");
     format!(
-        "[Desktop Entry]\nType=Application\nName=Deemo\nComment=Deemo rhythm game\nExec={} %f\nPath={}\nMimeType=application/x-deemopack;\nTerminal=false\nCategories=Game;\n",
+        "[Desktop Entry]\nType=Application\nName=Deemo\nComment=Deemo rhythm game\nExec={} %f\nPath={}\nIcon={}\nMimeType=application/x-deemopack;\nTerminal=false\nCategories=Game;\n",
         desktop_exec(exe),
-        path
+        path,
+        icon.display()
     )
 }
 

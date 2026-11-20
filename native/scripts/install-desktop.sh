@@ -44,11 +44,12 @@ exec_line=$bin
 case "$bin" in
     *[[:space:]]*) exec_line="\"$bin\"" ;;
 esac
-bin_dir=$(dirname -- "$bin")
-path_line=$bin_dir
-case "$bin_dir" in
-    *[[:space:]]*) path_line="\"$bin_dir\"" ;;
+# Path must be the directory that has data/ (release root or cargo tree root).
+path_line=$root
+case "$root" in
+    *[[:space:]]*) path_line="\"$root\"" ;;
 esac
+icon_line=$root/data/icon.png
 cat > "$apps_dir/deemo.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -56,6 +57,7 @@ Name=Deemo
 Comment=Deemo rhythm game
 Exec=$exec_line %f
 Path=$path_line
+Icon=$icon_line
 MimeType=application/x-deemopack;
 Terminal=false
 Categories=Game;
