@@ -6,7 +6,12 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SongResult {
     pub score: u64,
+    /// Легаси achievement (из счёта); оставлен для старых файлов и ранга.
     pub accuracy: f32,
+    /// Настоящая точность попаданий (osu-style). У старых записей поля нет —
+    /// её считаем из counts через [`SongResult::real_accuracy`].
+    #[serde(default)]
+    pub hit_accuracy: Option<f32>,
     pub max_combo: u32,
     pub perfect: u32,
     pub good: u32,
@@ -23,6 +28,7 @@ impl SongResult {
         SongResult {
             score: play.score,
             accuracy: acc,
+            hit_accuracy: Some(play.hit_accuracy()),
             max_combo: play.max_combo,
             perfect: play.counts[0],
             good: play.counts[1],
@@ -34,6 +40,25 @@ impl SongResult {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         }
+    }
+}
+
+impl SongResult {
+    /// Точность для показа: сохранённая hit accuracy или вычисленная из
+    /// counts (старые results.json). Никогда не achievement.
+    pub fn real_accuracy(&self) -> f32 {
+        self.hit_accuracy
+            .unwrap_or_else(|| hit_accuracy_from_counts(self.perfect, self.good, self.miss))
+    }
+}
+
+/// Точность попаданий из счётчиков: `(perfect + 0.5·good) / total · 100`.
+pub fn hit_accuracy_from_counts(perfect: u32, good: u32, miss: u32) -> f32 {
+    let total = perfect + good + miss;
+    if total == 0 {
+        0.0
+    } else {
+        ((perfect as f64 + 0.5 * good as f64) / total as f64 * 100.0) as f32
     }
 }
 
@@ -62,7 +87,11 @@ pub struct PlayRecord {
     pub song: String,
     pub diff: String,
     pub score: u64,
+    /// Легаси achievement; для показа используйте [`PlayRecord::real_accuracy`].
     pub accuracy: f32,
+    /// Настоящая точность попаданий; None в старых results.json.
+    #[serde(default)]
+    pub hit_accuracy: Option<f32>,
     pub max_combo: u32,
     pub perfect: u32,
     pub good: u32,
@@ -72,6 +101,13 @@ pub struct PlayRecord {
     pub timestamp: u64,
     #[serde(default)]
     pub speed: f32,
+}
+
+impl PlayRecord {
+    pub fn real_accuracy(&self) -> f32 {
+        self.hit_accuracy
+            .unwrap_or_else(|| hit_accuracy_from_counts(self.perfect, self.good, self.miss))
+    }
 }
 
 /// Дата из unix-времени: «ДД.ММ ЧЧ:ММ» (UTC).
@@ -132,6 +168,7 @@ impl Results {
             diff: diff.to_string(),
             score: r.score,
             accuracy: r.accuracy,
+            hit_accuracy: r.hit_accuracy,
             max_combo: r.max_combo,
             perfect: r.perfect,
             good: r.good,
@@ -168,5 +205,69 @@ impl Results {
         v.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         v.truncate(limit);
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chart::{Chart, Note, NoteKind};
+
+    fn chart_with(times: &[f32]) -> Chart {
+        Chart {
+            speed: 6.0,
+            notes: times
+                .iter()
+                .map(|&time| Note {
+                    time,
+                    pos: 0.0,
+                    size: 1.0,
+                    speed: 1.0,
+                    kind: NoteKind::Normal,
+                    hold: 0.0,
+                    sounds: vec![],
+                })
+                .collect(),
+            links: vec![],
+        }
+    }
+
+    #[test]
+    fn hit_accuracy_from_counts_matches_play() {
+        let chart = chart_with(&[1.0, 2.0, 3.0]);
+        let mut play = crate::play::Play::new(&chart);
+        play.counts = [2, 1, 7];
+        assert!((hit_accuracy_from_counts(2, 1, 7) - play.hit_accuracy()).abs() < 1e-6);
+        assert_eq!(hit_accuracy_from_counts(0, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn old_json_without_hit_accuracy_is_computed_from_counts() {
+        let old: SongResult = serde_json::from_str(
+            r#"{"score":900000,"accuracy":97.5,"max_combo":100,"perfect":80,"good":10,"miss":10,"rank":"A","full_combo":false,"timestamp":1}"#,
+        )
+        .unwrap();
+        let want = (80.0 + 0.5 * 10.0) / 100.0 * 100.0;
+        assert!((old.real_accuracy() - want).abs() < 1e-6);
+        let old_play: PlayRecord = serde_json::from_str(
+            r#"{"song":"s","diff":"hard","score":1,"accuracy":90.0,"max_combo":1,"perfect":9,"good":2,"miss":9,"rank":"A","full_combo":false,"timestamp":1}"#,
+        )
+        .unwrap();
+        let want_play = (9.0 + 1.0) / 20.0 * 100.0;
+        assert!((old_play.real_accuracy() - want_play).abs() < 1e-6);
+    }
+
+    #[test]
+    fn new_saves_round_trip_hit_accuracy() {
+        let chart = chart_with(&[1.0]);
+        let mut play = crate::play::Play::new(&chart);
+        play.counts = [1, 0, 0];
+        let r = SongResult::from_play(&play);
+        assert!((r.hit_accuracy.unwrap() - 100.0).abs() < 1e-6);
+        assert!((r.real_accuracy() - 100.0).abs() < 1e-6);
+        let text = serde_json::to_string(&r).unwrap();
+        let back: SongResult = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.hit_accuracy, r.hit_accuracy);
+        assert!((back.real_accuracy() - 100.0).abs() < 1e-6);
     }
 }

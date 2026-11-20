@@ -335,6 +335,7 @@ pub fn pack_path_from_args(args: &[String]) -> Option<std::path::PathBuf> {
 pub fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    #[allow(unused_mut)]
     let mut decoded = percent_decode(rest);
     #[cfg(windows)]
     {
@@ -2638,6 +2639,14 @@ impl App {
                     continue;
                 };
                 let (_, rec) = self.score_reports.remove(pos);
+                // 2xx без поля pp (старый сервер): ответ пришёл, показывать
+                // нечего — «—», а не вечный «PP PENDING».
+                if ack.is_none()
+                    && !self.queue.contains(&rec)
+                    && self.result_rec.as_ref() == Some(&rec)
+                {
+                    self.result_pp = ResultPp::Hidden;
+                }
                 // Запись уже вычеркнута из очереди → 2xx; иначе она осталась.
                 if ack.is_some() {
                     self.toast = Some((upload_toast(ack.as_ref()), Instant::now()));
@@ -3444,7 +3453,10 @@ impl App {
                 if let Some(chart) = self.songs.get(e.song).and_then(|s| s.charts.get(e.diff)) {
                     let sid = self.songs[e.song].id.clone();
                     let dn = chart.diff.clone();
-                    let want_lb = self.lb_online && self.online.logged_in();
+                    // Лидерборд нужен и в локальном виде: из него берётся pp
+                    // игрока для «BEST ON THIS CHART». Показываем его только
+                    // при lb_online (см. draw_records).
+                    let want_lb = self.online.logged_in();
                     self.request_leaderboard(&sid, &dn, want_lb);
                 }
             }
@@ -3809,9 +3821,12 @@ impl App {
         if let Some(driver) = replay {
             screens::draw_replay_badge(text, ui, &driver.nick, t, driver.end());
         }
-        let score = format!("{:08}", play.score);
-        let sw = text.measure(&score, 26.0);
-        text.draw(&score, w as f32 - sw - 24.0, 18.0, 26.0, WHITE, ui);
+        // В игре нет легаси-счёта: только текущая hit accuracy и комбо.
+        let acc = format!("{:.2}%", play.hit_accuracy());
+        let aw = text.measure(&acc, 26.0);
+        text.draw(&acc, w as f32 - aw - 24.0, 18.0, 26.0, WHITE, ui);
+        let acc_l = text.measure("ACCURACY", 10.0);
+        text.draw("ACCURACY", w as f32 - acc_l - 24.0, 48.0, 10.0, DIM, ui);
         if play.combo > 1 {
             let c = format!("{}", play.combo);
             text.draw_centered(&c, w as f32 * 0.5, h as f32 * 0.30, 56.0, [1.0, 1.0, 1.0, 0.85], ui);
@@ -4024,7 +4039,9 @@ pub fn shot_screen(
                         app.lb_records = recs;
                         app.lb_online = true;
                         app.online.state.token = Some("shot".into());
-                        app.online.state.nickname = Some("shot".into());
+                        app.online.state.nickname = Some(
+                            std::env::var("DEEMO_SHOT_NICK").unwrap_or_else(|_| "cyrsia".into()),
+                        );
                     }
                 }
             }

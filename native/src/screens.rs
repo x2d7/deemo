@@ -532,7 +532,7 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
     let sid = &song.id;
     let diff_name = chart.map(|c| c.diff.clone()).unwrap_or_default();
     if let Some(b) = v.results.best(sid, &diff_name) {
-        let cap = format!("BEST {} · {:.2}%", b.rank, b.accuracy);
+        let cap = format!("BEST {} · {:.2}%", b.rank, b.real_accuracy());
         text.draw_tracked(Face::Serif, &cap, x, y, 9.0 * s, 1.6 * s, ACCENT_INK, ui);
         y += 22.0 * s;
     }
@@ -547,7 +547,7 @@ fn draw_records(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f32)
             break;
         }
         let sub = format!("{} MISS · {}", r.miss, fmt_date(r.timestamp));
-        draw_record_row(ctx, ui, y, x, right, &fmt_score_local(r.score, true), &r.rank, r.score, r.accuracy, &sub);
+        draw_record_row(ctx, ui, y, x, right, &r.rank, r.real_accuracy(), &sub);
         y += 44.0 * s;
     }
 }
@@ -574,8 +574,9 @@ pub fn leaderboard_rows(g: &LibGeom, bottom_y: f32, count: usize) -> Vec<(usize,
         .collect()
 }
 
-/// Строка лидерборда: ранг, ник, счёт, настоящая точность, промахи и pp.
-/// Маленький ▶ справа — приглашение открыть детали плея.
+/// Строка лидерборда: ранг, ник, pp (главное число), настоящая точность,
+/// промахи и комбо. Легаси-счёта нет. Маленький ▶ справа — приглашение
+/// открыть детали плея.
 fn draw_leader_rows(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     let text = ctx.text;
     let white = ctx.white;
@@ -604,23 +605,19 @@ fn draw_leader_rows(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
             0.0,
         );
         text.draw(&nick, x + 42.0 * s, r[1] + 5.0 * s, 12.0 * s, if selected || hover { INK_HI } else { INK }, ui);
-        let score = fmt_score(rec.score, true);
-        let sw = text.measure(&score, 11.0 * s);
-        text.draw(&score, content_right - sw, r[1] + 6.0 * s, 11.0 * s, INK, ui);
+        // pp — главное число строки; счёта нет
+        let pp = crate::pp::tag(rec.pp);
+        let pw = text.measure(&pp, 12.0 * s);
+        text.draw(&pp, content_right - pw, r[1] + 5.0 * s, 12.0 * s, if selected || hover { ACCENT_INK } else { INK_HI }, ui);
 
-        // вторая строка: промахи/комбо слева, точность попаданий и pp справа
+        // вторая строка: промахи/комбо слева, hit accuracy справа
         let sub = format!("{} MISS · {}x", rec.miss, rec.max_combo);
         let sub = fit_simple(text, &sub, r[2] * 0.45, 8.5 * s);
         text.draw(&sub, x + 42.0 * s, r[1] + 24.0 * s, 8.5 * s, INK_FAINT, ui);
-        let acc_pp = format!(
-            "{:.2}% · {}",
-            rec.hit_accuracy(),
-            crate::pp::tag(rec.pp)
-        );
-        let apw = text.measure(&acc_pp, 9.0 * s);
-        let ap_x = (content_right - apw).max(x + 42.0 * s + 80.0 * s);
-        let ap_col = if selected || hover { ACCENT_INK } else { INK_DIM };
-        text.draw(&acc_pp, ap_x, r[1] + 24.0 * s, 9.0 * s, ap_col, ui);
+        let acc = format!("{:.2}%", rec.hit_accuracy());
+        let aw = text.measure(&acc, 9.0 * s);
+        let acc_col = if selected || hover { ACCENT_INK } else { INK_DIM };
+        text.draw(&acc, content_right - aw, r[1] + 24.0 * s, 9.0 * s, acc_col, ui);
 
         // ▶ — открыть детали (мышью или Enter по выбранной строке)
         theme::play_glyph(
@@ -635,16 +632,15 @@ fn draw_leader_rows(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Строка локальной истории: ранг, hit accuracy и промахи/дата. Счёта в UI
+/// больше нет — единственная метрика производительности приходит с сервера.
 fn draw_record_row(
     ctx: &Ctx,
     ui: &mut Vec<UiQuad>,
     y: f32,
     x: f32,
     right: f32,
-    score: &str,
     rank: &str,
-    _score_raw: u64,
     acc: f32,
     sub: &str,
 ) {
@@ -653,12 +649,11 @@ fn draw_record_row(
     let s = ctx.s;
     let rc = theme::rank_color(rank);
     text.draw_face(Face::Serif, rank, x, y - 1.0 * s, 16.0 * s, rc, ui);
-    text.draw_face(Face::Body, score, x + 34.0 * s, y, 13.0 * s, INK, ui);
-    let accs = format!("{acc:.1}%");
+    let accs = format!("{acc:.2}%");
     let aw = text.measure(&accs, 10.5 * s);
     text.draw(&accs, right - aw, y + 1.0 * s, 10.5 * s, INK_DIM, ui);
-    let sub = fit_simple(text, sub, right - x - 34.0 * s, 9.5 * s);
-    text.draw(&sub, x + 34.0 * s, y + 18.0 * s, 9.5 * s, INK_FAINT, ui);
+    let sub = fit_simple(text, sub, right - x - 34.0 * s - aw - 8.0 * s, 9.5 * s);
+    text.draw(&sub, x + 34.0 * s, y + 2.0 * s, 9.5 * s, INK_FAINT, ui);
     theme::hair_h(ui, white, x, y + 38.0 * s, right - x, [0.84, 0.80, 0.72, 0.07], s);
 }
 
@@ -760,12 +755,9 @@ fn draw_song_list(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, bottom_y: f3
             let rc = theme::rank_color(&best.rank);
             let rw = text.measure_face(Face::Display, &best.rank, 26.0 * s);
             text.draw_face(Face::Display, &best.rank, r[0] + r[2] - 18.0 * s - rw, r[1] + 18.0 * s, 26.0 * s, rc, ui);
-            let acc = format!("{:.2}%", best.accuracy);
+            let acc = format!("{:.2}%", best.real_accuracy());
             let aw = text.measure(&acc, 11.0 * s);
             text.draw(&acc, r[0] + r[2] - 18.0 * s - aw, r[1] + 48.0 * s, 11.0 * s, INK_DIM, ui);
-            let sc = fmt_score_local(best.score, false);
-            let sw = text.measure(&sc, 9.5 * s);
-            text.draw(&sc, r[0] + r[2] - 18.0 * s - sw, r[1] + 63.0 * s, 9.5 * s, INK_FAINT, ui);
         }
     }
 
@@ -796,6 +788,20 @@ pub fn scrollbar(
     let max_scroll = (total_h - view_h).max(1.0);
     let ty = track[1] + (track[3] - thumb_h) * (scroll / max_scroll).clamp(0.0, 1.0);
     Some((track, [track[0], ty, 2.0 * s, thumb_h]))
+}
+
+/// pp игрока из серверного лидерборда выбранной карты. Только при входе и
+/// только значение `OnlineRecord.pp`; никакой локальной оценки.
+fn player_pp(v: &LibraryView) -> Option<f64> {
+    let nick = v.online.state.nickname.as_deref()?;
+    if !v.online.logged_in() {
+        return None;
+    }
+    v.lb_records
+        .iter()
+        .find(|r| r.nickname == nick)
+        .and_then(|r| r.pp)
+        .map(f64::from)
 }
 
 fn draw_bottom(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, by: f32, w: f32, h: f32) {
@@ -851,19 +857,41 @@ fn draw_bottom(ctx: &Ctx, v: &LibraryView, ui: &mut Vec<UiQuad>, by: f32, w: f32
     let meta = fit_simple(text, &meta, 420.0 * s, 9.5 * s);
     text.draw(&meta, MARGIN * s, by + 92.0 * s, 9.5 * s, INK_FAINT, ui);
 
-    // на месте прежних чипов — лучший результат именно этого чарта
+    // на месте прежних чипов — лучший результат именно этого чарта.
+    // pp берём только из серверной записи игрока; локальный рекорд — только
+    // hit accuracy, без придуманного pp и без легаси-счёта.
     let bx = MARGIN * s + 500.0 * s;
     theme::label(text, ui, "BEST ON THIS CHART", bx, by + 28.0 * s, 8.5 * s, 2.2 * s, INK_FAINT);
-    match v.results.best(&song.id, &chart.diff) {
-        Some(b) => {
-            let rc = theme::rank_color(&b.rank);
-            text.draw_face(Face::Serif, &b.rank, bx, by + 44.0 * s, 30.0 * s, rc, ui);
-            text.draw_face(Face::Body, &format!("{:.2}%", b.accuracy), bx + 58.0 * s, by + 46.0 * s, 16.0 * s, INK, ui);
-            text.draw(&fmt_score_local(b.score, false), bx + 58.0 * s, by + 68.0 * s, 10.0 * s, INK_FAINT, ui);
+    let local_best = v.results.best(&song.id, &chart.diff);
+    if let Some(pp) = player_pp(v) {
+        let val = crate::pp::plain64(pp);
+        text.draw_face(Face::Serif, &val, bx, by + 40.0 * s, 30.0 * s, ACCENT_INK, ui);
+        let vw = text.measure_face(Face::Serif, &val, 30.0 * s);
+        theme::label(text, ui, "PP", bx + vw + 6.0 * s, by + 54.0 * s, 9.0 * s, 2.0 * s, INK_DIM);
+        if let Some(b) = local_best {
+            let line = format!("{} · {:.2}%", b.rank, b.real_accuracy());
+            text.draw(&line, bx, by + 78.0 * s, 9.5 * s, INK_FAINT, ui);
         }
-        None => {
-            text.draw("Not played yet", bx, by + 48.0 * s, 13.0 * s, INK_FAINT, ui);
-        }
+    } else if let Some(b) = local_best {
+        text.draw_face(
+            Face::Serif,
+            &format!("{:.2}%", b.real_accuracy()),
+            bx,
+            by + 40.0 * s,
+            30.0 * s,
+            INK,
+            ui,
+        );
+        text.draw(
+            &format!("{} · BEST ACCURACY", b.rank),
+            bx,
+            by + 78.0 * s,
+            9.5 * s,
+            INK_FAINT,
+            ui,
+        );
+    } else {
+        text.draw("Not played yet", bx, by + 48.0 * s, 13.0 * s, INK_FAINT, ui);
     }
 
     // PLAY
@@ -996,6 +1024,17 @@ pub fn pp_line(pp: ResultPp) -> Option<String> {
     crate::pp::result_line(pp)
 }
 
+/// Крупное число pp на экране результата. `Ready` — значение из ack
+/// сервера; `Pending` — `PP PENDING`; `Hidden` — «—» (не вошли или старый
+/// сервер не прислал pp).
+pub fn result_pp_text(pp: ResultPp) -> String {
+    match pp {
+        ResultPp::Ready { pp, .. } => crate::pp::signed64(pp),
+        ResultPp::Pending => crate::pp::pending_text().to_string(),
+        ResultPp::Hidden => "—".to_string(),
+    }
+}
+
 pub struct ResultView<'a> {
     pub song_title: &'a str,
     pub artist: &'a str,
@@ -1060,22 +1099,26 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
     text.draw_centered_face(Face::Display, v.rank, rank_x, y(146.0), z(118.0), rank_col, ui);
     theme::label(text, ui, "RANK", rank_x - 18.0 * k, y(278.0), z(9.0), 3.0 * k, INK_DIM);
 
-    // счёт справа
-    let score = fmt_score_local(v.play.score, true);
+    // справа — pp из ответа сервера: главное число результата.
     let sr = cx + 300.0 * k;
-    let sw = text.measure_face(Face::Display, &score, z(58.0));
-    text.draw_face(Face::Display, &score, sr - sw, y(148.0), z(58.0), INK_HI, ui);
-    let acc = format!("{:.2}%", v.play.accuracy());
+    let (pp_size, pp_col) = match v.pp {
+        ResultPp::Ready { .. } => (58.0, INK_HI),
+        ResultPp::Pending => (34.0, INK_DIM),
+        ResultPp::Hidden => (58.0, INK_FAINT),
+    };
+    let pp_text = result_pp_text(v.pp);
+    let pw = text.measure_face(Face::Display, &pp_text, z(pp_size));
+    text.draw_face(Face::Display, &pp_text, sr - pw, y(148.0), z(pp_size), pp_col, ui);
+    let pp_l = "PP";
+    let pplw = text.measure_tracked(Face::Serif, pp_l, z(8.5), 3.0 * k);
+    text.draw_tracked(Face::Serif, pp_l, sr - pplw, y(212.0), z(8.5), 3.0 * k, INK_FAINT, ui);
+    // accuracy — настоящая hit accuracy, не achievement из счёта
+    let acc = format!("{:.2}%", v.play.hit_accuracy());
     let aw = text.measure_face(Face::Serif, &acc, z(22.0));
-    text.draw_face(Face::Serif, &acc, sr - aw, y(220.0), z(22.0), INK, ui);
-    let score_l = "SCORE";
-    let slw = text.measure_tracked(Face::Serif, score_l, z(8.5), 3.0 * k);
-    text.draw_tracked(Face::Serif, score_l, sr - slw, y(252.0), z(8.5), 3.0 * k, INK_FAINT, ui);
-    // настоящая точность попаданий (osu-стиль) — отдельно от achievement above:
-    // `98.74%`/счёт — игра как есть, эта строка — то, что видят сервер и сайт.
-    let hit = format!("ACCURACY {:.2}%", v.play.hit_accuracy());
-    let hitw = text.measure_tracked(Face::Serif, &hit, z(9.0), 2.2 * k);
-    text.draw_tracked(Face::Serif, &hit, sr - hitw, y(272.0), z(9.0), 2.2 * k, INK_DIM, ui);
+    text.draw_face(Face::Serif, &acc, sr - aw, y(236.0), z(22.0), INK, ui);
+    let acc_l = "ACCURACY";
+    let alw = text.measure_tracked(Face::Serif, acc_l, z(9.0), 2.2 * k);
+    text.draw_tracked(Face::Serif, acc_l, sr - alw, y(270.0), z(9.0), 2.2 * k, INK_DIM, ui);
     if v.is_record {
         let tag = "NEW RECORD";
         let tw = text.measure_tracked(Face::Serif, tag, z(9.0), 3.0 * k);
@@ -1107,16 +1150,7 @@ pub fn draw_result(ctx: &Ctx, v: &ResultView, ui: &mut Vec<UiQuad>) {
         }
     }
 
-    // pp из ответа сервера: одна маленькая строка прямо под статистикой.
-    // Отправка идёт в фоне, поэтому до ответа — «PP PENDING» (или ничего,
-    // если игрок не вошёл).
-    if let Some(line) = pp_line(v.pp) {
-        let col = match v.pp {
-            ResultPp::Ready { .. } => ACCENT_INK,
-            _ => INK_FAINT,
-        };
-        text.draw_centered_tracked(Face::Serif, &line, cx, y(354.0), z(9.5), 2.2 * k, col, ui);
-    }
+    // Big pp already carries the server value/state; no score line anywhere.
 
     // гистограммы таймингов
     let hw = (w - MARGIN * k * 2.0).min(960.0 * k);
@@ -1282,14 +1316,14 @@ pub fn draw_play_detail(ctx: &Ctx, v: &PlayDetailView, ui: &mut Vec<UiQuad>) -> 
     text.draw_centered_face(Face::Display, &rec.rank, rank_x, y(146.0), z(118.0), rank_col, ui);
     theme::label(text, ui, "RANK", rank_x - 18.0 * k, y(278.0), z(9.0), 3.0 * k, INK_DIM);
 
-    // счёт и настоящая точность попаданий справа
+    // pp и настоящая точность попаданий справа; счёта нет
     let sr = cx + 300.0 * k;
-    let score = fmt_score(rec.score, true);
-    let sw = text.measure_face(Face::Display, &score, z(52.0));
-    text.draw_face(Face::Display, &score, sr - sw, y(136.0), z(52.0), INK_HI, ui);
-    let score_l = "SCORE";
-    let slw = text.measure_tracked(Face::Serif, score_l, z(8.5), 3.0 * k);
-    text.draw_tracked(Face::Serif, score_l, sr - slw, y(118.0), z(8.5), 3.0 * k, INK_FAINT, ui);
+    let pp_text = crate::pp::signed(rec.pp);
+    let pw = text.measure_face(Face::Display, &pp_text, z(52.0));
+    text.draw_face(Face::Display, &pp_text, sr - pw, y(136.0), z(52.0), INK_HI, ui);
+    let pp_l = "PP";
+    let pplw = text.measure_tracked(Face::Serif, pp_l, z(8.5), 3.0 * k);
+    text.draw_tracked(Face::Serif, pp_l, sr - pplw, y(118.0), z(8.5), 3.0 * k, INK_FAINT, ui);
     let acc = format!("{:.2}%", rec.hit_accuracy());
     let aw = text.measure_face(Face::Serif, &acc, z(26.0));
     text.draw_face(Face::Serif, &acc, sr - aw, y(200.0), z(26.0), INK, ui);
@@ -1464,25 +1498,6 @@ pub fn diff_name(d: &str) -> &'static str {
     }
 }
 
-pub fn fmt_score(s: u64, spaced: bool) -> String {
-    let digits = s.to_string();
-    if !spaced {
-        return digits;
-    }
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn fmt_score_local(s: u64, spaced: bool) -> String {
-    fmt_score(s, spaced)
-}
-
 /// Обрезка строки с «…» под выбранную гарнитуру.
 pub fn fit_face(text: &Text, face: Face, s: &str, max_w: f32, size: f32, tracking: f32) -> String {
     if text.measure_tracked(face, s, size, tracking) <= max_w {
@@ -1553,5 +1568,39 @@ mod tests {
         assert_eq!(fmt_offset(Some(-3.0)), "-3");
         assert_eq!(fmt_offset(Some(0.0)), "+0");
         assert_eq!(fmt_offset(None), "—");
+    }
+
+    /// Легаси-счёт 0..1,000,000 не должен иметь UI-пути: форматтер удалён,
+    /// в screens/app нет его использования, HUD больше не печатает `{:08}`.
+    /// Крупное число результата: pp из ack, ожидание или честный прочерк.
+    #[test]
+    fn result_big_number_is_pp_only() {
+        assert_eq!(
+            super::result_pp_text(super::ResultPp::Ready {
+                pp: 86.2475,
+                total_pp: None,
+                pp_tablet: None,
+                pp_mouse: None,
+                record: false,
+            }),
+            "+86.2"
+        );
+        assert_eq!(
+            super::result_pp_text(super::ResultPp::Pending),
+            crate::pp::pending_text()
+        );
+        assert_eq!(super::result_pp_text(super::ResultPp::Hidden), "—");
+    }
+
+    #[test]
+    fn legacy_score_is_not_rendered() {
+        let screens = include_str!("screens.rs");
+        let app = include_str!("app.rs");
+        let formatter = ["fmt_", "score"].concat();
+        let score_label = ["SC", "ORE"].concat();
+        let hud_format = ["format!(\"", "{:08}", "\")"].concat();
+        assert!(!screens.contains(&formatter), "score formatter still in UI");
+        assert!(!screens.contains(&score_label), "legacy score label still in UI");
+        assert!(!app.contains(&hud_format), "HUD still formats the legacy score");
     }
 }

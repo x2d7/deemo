@@ -24,9 +24,19 @@ pub fn signed(pp: Option<f32>) -> String {
     }
 }
 
-fn signed64(pp: f64) -> String {
+/// То же для `f64` из ack: `+86.2` / `—` при нечисле.
+pub fn signed64(pp: f64) -> String {
     if pp.is_finite() {
         format!("{pp:+.1}")
+    } else {
+        "—".to_string()
+    }
+}
+
+/// Без знака (`86.2`), для крупного числа в панели лучшего результата.
+pub fn plain64(pp: f64) -> String {
+    if pp.is_finite() {
+        format!("{pp:.1}")
     } else {
         "—".to_string()
     }
@@ -80,12 +90,17 @@ pub fn detail_line(rec: &OnlineRecord) -> String {
     line
 }
 
+/// Подпись ожидания: ровно `PP PENDING`, без числа.
+pub fn pending_text() -> &'static str {
+    "PP PENDING"
+}
+
 /// Строка pp на экране результата: значения из ack очереди (`ScoreAck`),
 /// который пришёл с сервера. `Pending` — без числа.
 pub fn result_line(pp: crate::screens::ResultPp) -> Option<String> {
     match pp {
         crate::screens::ResultPp::Hidden => None,
-        crate::screens::ResultPp::Pending => Some("PP PENDING".to_string()),
+        crate::screens::ResultPp::Pending => Some(pending_text().to_string()),
         crate::screens::ResultPp::Ready {
             pp,
             total_pp,
