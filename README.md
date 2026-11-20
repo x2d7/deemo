@@ -8,8 +8,7 @@ A Deemo-style rhythm game for PC (Linux, Windows) built around a chart server:
   pp; the profile sums the best plays.
 - **Two independent cursors**: one per hand, each judged separately.
 
-The game itself: a song library, falling notes at the judge line, and a result
-screen with a timing histogram.
+The game itself: a song library and falling notes at the judge line.
 
 ## Two cursors
 
