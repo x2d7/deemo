@@ -1,10 +1,14 @@
 # deemo
 
-A Deemo-style rhythm game for PC (Linux) with two independent cursors at once:
-a song library with previews and records, falling-note play at the judge line,
-and a result screen with a tap-timing histogram.
+A Deemo-style rhythm game for PC (Linux, Windows) built around a chart server:
 
-A chart server can be connected for uploading and downloading charts.
+- **Charts**: upload and download packs, public profiles, per-chart leaderboards.
+- **Stars and pp**: every chart is rated from its content, and every play earns
+  pp; the profile sums the best plays.
+- **Two independent cursors**: one per hand, each judged separately.
+
+The game itself: a song library, falling notes at the judge line, and a result
+screen with a timing histogram.
 
 ## Two cursors
 
