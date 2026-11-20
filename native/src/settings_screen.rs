@@ -117,7 +117,7 @@ impl Row {
             Row::XTol => "X tolerance",
             Row::Guides => "Note guides",
             Row::MouseAbs => "Absolute mouse",
-            Row::LineCursor => "Line cursor",
+            Row::LineCursor => "Hide cursor (1D aim)",
             Row::RmbPen => "RMB = pen press",
             Row::Fullscreen => "Fullscreen",
             Row::MouseOffset => "Mouse offset",
@@ -1265,11 +1265,13 @@ mod tests {
             let _ = sc.on_key(&down, false, false);
         }
         assert_eq!(sc.rows[sc.row], Row::LineCursor, "row {row:?}", row = sc.row);
+        let was = sc.draft.line_cursor;
         let _ = sc.on_key(&space, false, false);
-        assert!(sc.draft.line_cursor);
+        assert_eq!(sc.draft.line_cursor, !was, "Space toggles Hide cursor");
         let _ = sc.on_key(&down, false, false);
         assert_eq!(sc.rows[sc.row], Row::RmbPen);
+        let was = sc.draft.rmb_pen_press;
         let _ = sc.on_key(&space, false, false);
-        assert!(sc.draft.rmb_pen_press);
+        assert_eq!(sc.draft.rmb_pen_press, !was, "Space toggles RMB");
     }
 }

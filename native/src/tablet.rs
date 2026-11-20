@@ -40,8 +40,11 @@ pub struct TabletState {
     pub hover: bool,
     /// нажим стилусом (давление выше порога)
     pub press: bool,
-    /// нормализованный X 0..1 по ширине конкретного планшета
+    /// нормализованный X 0..1 по ширине конкретного планшета (с учётом zoom)
     pub x_norm: f32,
+    /// тот же X без zoom: им пользуется фильтр эмулированной мыши, потому что
+    /// композитор двигает системный курсор по полной ширине планшета
+    pub x_norm_raw: f32,
 }
 
 /// Сырой репорт планшета с wall-time (для реплея/отладки ввода).
@@ -146,7 +149,7 @@ pub fn pen_emulates_motion(
     width: f32,
 ) -> bool {
     report.is_some_and(|st| {
-        st.present && pen_matches_cursor(st.x_norm, cursor_x, width, PEN_X_TOLERANCE)
+        st.present && pen_matches_cursor(st.x_norm_raw, cursor_x, width, PEN_X_TOLERANCE)
     })
 }
 
@@ -235,19 +238,21 @@ impl Sink {
         let Some((x, p, hover)) = parse_report(self.kind, bytes) else {
             return false;
         };
-        let xn = (((x as f32 / x_max_of(self.kind)) - 0.5) * self.zoom + 0.5).clamp(0.0, 1.0);
+        let raw = (x as f32 / x_max_of(self.kind)).clamp(0.0, 1.0);
+        let xn = ((raw - 0.5) * self.zoom + 0.5).clamp(0.0, 1.0);
         let press = !hover && p > self.press_threshold;
-        self.emit(x, p, hover, press, xn, bytes);
+        self.emit(x, p, hover, press, xn, raw, bytes);
         true
     }
 
     /// Покормить sink отчётом стандартной HID digitizer-коллекции.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn digitizer_report(&self, r: &crate::hid_desc::PenReading, bytes: &[u8]) {
-        let xn = ((r.x_norm - 0.5) * self.zoom + 0.5).clamp(0.0, 1.0);
+        let raw = r.x_norm.clamp(0.0, 1.0);
+        let xn = ((raw - 0.5) * self.zoom + 0.5).clamp(0.0, 1.0);
         // Кончик важнее давления: некоторые перья шлют p=0 при контакте.
         let press = r.tip && r.in_range;
-        self.emit(r.x_raw, r.pressure, !r.tip, press, xn, bytes);
+        self.emit(r.x_raw, r.pressure, !r.tip, press, xn, raw, bytes);
     }
 
     fn emit(
@@ -257,6 +262,7 @@ impl Sink {
         hover: bool,
         press: bool,
         x_norm: f32,
+        x_norm_raw: f32,
         bytes: &[u8],
     ) {
         let now = Instant::now();
@@ -277,6 +283,7 @@ impl Sink {
                 hover,
                 press,
                 x_norm,
+                x_norm_raw,
             };
         }
         // какой планшет говорил последним (для маркера и слайдов)
@@ -346,7 +353,7 @@ impl Tablets {
         }
         #[cfg(not(windows))]
         {
-            let gaomon = find_nodes(GAOMON_VID, GAOMON_PID);
+            let gaomon = find_nodes_any_pid(GAOMON_VID);
             let parblo = find_nodes(PARBLO_VID, PARBLO_PID);
             for node in &gaomon {
                 t.spawn_node(node, "gaomon", zoom, GAOMON_PRESS_THRESHOLD);
@@ -393,7 +400,10 @@ impl Tablets {
         let mut f = match File::open(node) {
             Ok(f) => f,
             Err(e) => {
-                println!("tablet: {kind} open failed ({node}): {e}");
+                println!(
+                    "tablet: {kind} open failed ({node}): {e} — hidraw access is root-only; \
+                     run scripts/install-udev.sh once"
+                );
                 return;
             }
         };
@@ -578,7 +588,7 @@ fn probe_hidraw(seconds: f32) -> anyhow::Result<()> {
     let targets: Vec<(String, &'static str)> = nodes
         .iter()
         .filter_map(|(node, vid, pid)| {
-            if vid == "256c" && pid == "006d" {
+            if vid == "256c" {
                 Some((node.clone(), "gaomon"))
             } else if vid == "0483" && pid == "a019" {
                 Some((node.clone(), "parblo"))
@@ -598,7 +608,15 @@ fn probe_hidraw(seconds: f32) -> anyhow::Result<()> {
     for (node, kind) in targets {
         let log = log.clone();
         std::thread::spawn(move || {
-            let Ok(mut f) = File::open(&node) else { return };
+            let mut f = match File::open(&node) {
+                Ok(f) => f,
+                Err(e) => {
+                    log.lock().unwrap().line(&format!(
+                        "{node}: open failed: {e} — hidraw access is root-only; run scripts/install-udev.sh"
+                    ));
+                    return;
+                }
+            };
             let mut buf = [0u8; 64];
             let mut shown = 0usize;
             loop {
@@ -657,6 +675,23 @@ fn vidpid(node: &str) -> (String, String) {
 }
 
 #[cfg(not(windows))]
+fn find_nodes_any_pid(vid: u16) -> Vec<String> {
+    let vid = format!("{vid:04x}");
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/hidraw") {
+        for e in rd.flatten() {
+            let node = format!("/dev/{}", e.file_name().to_string_lossy());
+            let (v, _p) = vidpid(&node);
+            if v == vid {
+                out.push(node);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(not(windows))]
 fn find_nodes(vid: u16, pid: u16) -> Vec<String> {
     let vid = format!("{vid:04x}");
     let pid = format!("{pid:04x}");
@@ -686,6 +721,7 @@ mod tests {
         TabletState {
             present: true,
             x_norm,
+            x_norm_raw: x_norm,
             ..Default::default()
         }
     }
@@ -733,6 +769,22 @@ mod tests {
         assert!(!pen_emulates_motion(Some(p), 0.2 * 1280.0, 1280.0));
         // press-фильтр кликов не изменился: hover без нажатия клик не глушит
         assert!(!pen_emulates_mouse(false, false, Some(p), 0.5 * 1280.0, 1280.0));
+    }
+
+    #[test]
+    fn zoom_does_not_break_the_emulated_mouse_filter() {
+        // tablet_zoom=1.8 сдвигает игровой x_norm, но системный курсор
+        // композитор двигает по полной ширине планшета — фильтр обязан
+        // сравнивать raw-позицию, иначе перо «уводит» мышь.
+        let raw = 0.7f32;
+        let st = TabletState {
+            present: true,
+            x_norm: ((raw - 0.5) * 1.8 + 0.5).clamp(0.0, 1.0),
+            x_norm_raw: raw,
+            ..TabletState::default()
+        };
+        assert!(pen_emulates_motion(Some(st), raw * 1280.0, 1280.0));
+        assert!(!pen_emulates_motion(Some(st), st.x_norm * 1280.0, 1280.0));
     }
 
     #[test]

@@ -299,12 +299,11 @@ impl<'a> Scene<'a> {
     }
 }
 
-/// Курсор просмотра реплея: два вертикальных луча — левый (перо) и правый
-/// (мышь), как маркеры ввода в игре. Никаких точек и хвоста из 12 точек:
-/// несколько квадов на луч, без аллокаций на кадр.
+/// Курсор просмотра реплея — ровно те же `stage::marker`, что и в живой игре:
+/// мышь (голубой) и перо (оранжевый) на своих X. Никаких glow/ядер/хвостов.
 ///
-/// На кадре попадания прилипший к `x_note` луч стоит ровно на ноте
-/// (см. [`crate::replay::ReplayDriver::beam_x`]); второй идёт по своему треку.
+/// На кадре попадания маркер соответствующей руки стоит на `x_note` и
+/// короткое время рисуется в pressed-состоянии (`stage::marker` шире/ярче).
 pub fn push_replay_cursor(
     out: &mut Vec<Sprite>,
     driver: &crate::replay::ReplayDriver,
@@ -314,62 +313,51 @@ pub fn push_replay_cursor(
     if !driver.has_cursor() {
         return;
     }
-    for side in [BeamSide::Left, BeamSide::Right] {
-        if let Some(px) = driver.beam_x(t, side) {
-            push_beam(out, note_x(px), side);
+    // тот же порядок и цвета, что в игровом цикле: мышь, затем перо
+    for (side, color) in [
+        (BeamSide::Right, [0.3, 0.8, 1.0, 1.0]),
+        (BeamSide::Left, [1.0, 0.6, 0.2, 1.0]),
+    ] {
+        if let Some((px, press)) = driver.marker_state(t, side) {
+            out.push(marker(note_x(px), color, press));
         }
     }
 }
 
-/// Живые лучи Line cursor: правая рука — мышь, левая — перо (если планшет
-/// присутствует). Тот же визуал, что у просмотра реплея.
-pub fn push_live_cursor(out: &mut Vec<Sprite>, mouse_x: f32, pen_x: Option<f32>) {
-    use crate::replay::BeamSide;
-    push_beam(out, mouse_x, BeamSide::Right);
-    if let Some(px) = pen_x {
-        push_beam(out, px, BeamSide::Left);
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::{ReplayBlob, ReplayDriver, ReplayFormat, TrackPoint};
 
-fn beam_tint(side: crate::replay::BeamSide) -> [f32; 4] {
-    use crate::replay::BeamSide;
-    match side {
-        BeamSide::Left => [1.00, 0.66, 0.30, 1.0],
-        BeamSide::Right => [0.42, 0.78, 1.00, 1.0],
+    /// Replay cursor — ровно `stage::marker`: та же текстура/длина/альфа,
+    /// голубая мышь и оранжевое перо.
+    #[test]
+    fn replay_markers_use_the_same_stage_marker_sprite() {
+        let chart = Chart::empty();
+        let blob = ReplayBlob {
+            format: ReplayFormat::Dmr3,
+            notes: vec![],
+            right: vec![
+                TrackPoint { t: 0.0, x: -1.0 },
+                TrackPoint { t: 1.0, x: -1.0 },
+            ],
+            left: vec![
+                TrackPoint { t: 0.0, x: 1.0 },
+                TrackPoint { t: 1.0, x: 1.0 },
+            ],
+        };
+        let driver = ReplayDriver::new(&chart, &blob, "kid").unwrap();
+        let mut out = Vec::new();
+        push_replay_cursor(&mut out, &driver, 0.5);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.tex == Tex::Marker));
+        assert!(out.iter().all(|s| !s.additive));
+        assert!(out.iter().all(|s| s.size[1] == NOTE_PANEL_BASE_LENGTH));
+        assert!(out.iter().all(|s| s.size[0] == 0.18), "unpressed width");
+        // порядок: мышь (голубая), затем перо (оранжевое)
+        assert_eq!(&out[0].color[..3], &[0.3, 0.8, 1.0]);
+        assert_eq!(&out[1].color[..3], &[1.0, 0.6, 0.2]);
+        assert_eq!(out[0].origin[0], note_x(-1.0));
+        assert_eq!(out[1].origin[0], note_x(1.0));
     }
-}
-
-/// Один вертикальный луч: широкий ореол + тонкое ядро + мягкое свечение у
-/// основания. Несколько квадов, без аллокаций.
-fn push_beam(out: &mut Vec<Sprite>, x: f32, side: crate::replay::BeamSide) {
-    let tint = beam_tint(side);
-    out.push(Sprite::tilted(
-        Tex::White,
-        [x, 0.0, 0.0],
-        0.09,
-        3.8,
-        0.0,
-        [0.5, 0.0],
-        [tint[0], tint[1], tint[2], 0.16],
-    ));
-    out.push(Sprite::tilted(
-        Tex::White,
-        [x, 0.0, 0.0],
-        0.026,
-        3.8,
-        0.0,
-        [0.5, 0.0],
-        [tint[0], tint[1], tint[2], 0.78],
-    ));
-    let mut glow = Sprite::tilted(
-        Tex::Glow,
-        [x, 0.01, 0.0],
-        0.52,
-        0.34,
-        std::f32::consts::FRAC_PI_2,
-        [0.5, 0.5],
-        [tint[0], tint[1], tint[2], 0.30],
-    );
-    glow.additive = false;
-    out.push(glow);
 }

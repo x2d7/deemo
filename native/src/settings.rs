@@ -34,9 +34,10 @@ pub struct Settings {
     /// мышь: абсолютная позиция курсора (клик по колонке ноты) вместо относительного delta
     #[serde(default)]
     pub mouse_absolute: bool,
-    /// «Line cursor»: в игре скрыть системный курсор и рисовать два луча
-    /// (мышь/перо) на судейской линии. По умолчанию off — прежнее поведение.
-    #[serde(default)]
+    /// «Hide cursor (1D aim)»: в игре скрыть системный курсор в обоих режимах
+    /// (relative/absolute); прицел остаётся только по X. Без новых визуалов.
+    /// По умолчанию on: системный pointer в игре не нужен, курсоры — засечки.
+    #[serde(default = "def_true")]
     pub line_cursor: bool,
     /// «RMB = pen press»: правая кнопка мыши управляет левой рукой (тап/слайд
     /// с планшетным оффсетом), собственный press пера игнорируется.
@@ -86,7 +87,7 @@ impl Default for Settings {
             note_guides: false,
             x_tolerance: def_xtol(),
             mouse_absolute: false,
-            line_cursor: false,
+            line_cursor: true,
             rmb_pen_press: false,
             mouse_offset_ms: 0.0,
             tablet_offset_ms: 0.0,
@@ -120,12 +121,12 @@ mod tests {
     /// читается (serde default = false), а включённые значения переживают
     /// round-trip файла.
     #[test]
-    fn cursor_options_default_off_and_round_trip() {
+    fn cursor_options_default_and_round_trip() {
         let d = Settings::default();
-        assert!(!d.line_cursor && !d.rmb_pen_press);
+        assert!(d.line_cursor && !d.rmb_pen_press);
         let old: Settings = serde_json::from_str(r#"{"speed":6.5,"mouse_absolute":true}"#)
             .expect("old settings file");
-        assert!(!old.line_cursor && !old.rmb_pen_press);
+        assert!(old.line_cursor && !old.rmb_pen_press);
         let on = Settings {
             line_cursor: true,
             rmb_pen_press: true,
@@ -135,6 +136,10 @@ mod tests {
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert!(back.line_cursor && back.rmb_pen_press);
     }
+}
+
+fn def_true() -> bool {
+    true
 }
 
 const PATH: &str = "data/settings.json";

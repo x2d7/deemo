@@ -217,15 +217,13 @@ pub fn queue_toast(immediate: bool, uploaded: usize, still_queued: bool) -> Opti
     }
 }
 
-/// Скрывать ли системный курсор: в игре — всегда при Line cursor, иначе
+/// Скрывать ли системный курсор: в игре — всегда при Hide cursor, иначе
 /// только в относительном режиме (как раньше). В меню — показывать.
 pub fn hide_system_cursor(play: bool, line_cursor: bool, mouse_absolute: bool) -> bool {
     play && (line_cursor || !mouse_absolute)
 }
 
-/// Какая рука и какая X у нажатия. Для обычной мыши — правая рука/мышь;
-/// при `rmb_pen_press` правая кнопка всегда считается левой рукой (планшетный
-/// оффсет), а X берётся у пера, если планшет вообще присутствует.
+/// Какая рука и какая X у нажатия.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PressDevice {
     Mouse,
@@ -236,24 +234,75 @@ pub enum PressDevice {
 pub struct PressAim {
     pub device: PressDevice,
     pub x: f32,
-    /// Нажатие использует планшетный оффсет (левая рука).
+    /// Нажатие использует планшетный оффсет (рука пера).
     pub tablet_offset: bool,
 }
 
-pub fn press_aim(rmb_pen_press: bool, pen_x: Option<f32>, mouse_x: f32) -> PressAim {
-    if rmb_pen_press {
-        PressAim {
-            device: PressDevice::Pen,
-            x: pen_x.unwrap_or(mouse_x),
-            tablet_offset: true,
-        }
-    } else {
-        PressAim {
-            device: PressDevice::Mouse,
-            x: mouse_x,
-            tablet_offset: false,
+fn mouse_aim(x: f32) -> PressAim {
+    PressAim {
+        device: PressDevice::Mouse,
+        x,
+        tablet_offset: false,
+    }
+}
+
+fn pen_aim(x: f32) -> PressAim {
+    PressAim {
+        device: PressDevice::Pen,
+        x,
+        tablet_offset: true,
+    }
+}
+
+/// Два курсора, упорядоченные по X: первый — левый (LMB), второй — правый
+/// (RMB). При равном X левым считается мышь. Без пера оба — мышь.
+pub fn cursor_sides(mouse_x: f32, pen_x: Option<f32>) -> (PressAim, PressAim) {
+    match pen_x {
+        Some(px) if px < mouse_x => (pen_aim(px), mouse_aim(mouse_x)),
+        Some(px) => (mouse_aim(mouse_x), pen_aim(px)),
+        None => (mouse_aim(mouse_x), mouse_aim(mouse_x)),
+    }
+}
+
+/// Нажатие курсора на выбранную руку. Используется и тапом, и руками для
+/// статистики; LMB/RMB в RMB-режиме передают сюда левый/правый [`PressAim`].
+pub fn apply_cursor_tap(
+    play: &mut crate::play::Play,
+    chart: &crate::chart::Chart,
+    t: f32,
+    aim: PressAim,
+    hands: &mut crate::play::Hands,
+) -> Option<Judge> {
+    let judge = play.tap(chart, t, aim.x);
+    if let Some(j) = judge {
+        match aim.device {
+            PressDevice::Pen => hands.tablet.add(j),
+            PressDevice::Mouse => hands.mouse.add(j),
         }
     }
+    judge
+}
+
+/// Press-состояние маркеров. В обычном режиме мышь — по LMB, перо — по
+/// tip-press. В RMB-режиме маркеры отражают только кнопки, привязанные к их
+/// стороне; касание пера само по себе press не даёт.
+pub fn cursor_marker_press(
+    rmb_pen_press: bool,
+    mouse_x: f32,
+    pen_x: Option<f32>,
+    left_held: bool,
+    right_held: bool,
+    pen_tip: bool,
+) -> (bool, bool) {
+    if !rmb_pen_press {
+        return (left_held, pen_x.is_some() && pen_tip);
+    }
+    let (left, right) = cursor_sides(mouse_x, pen_x);
+    let mouse = (left.device == PressDevice::Mouse && left_held)
+        || (right.device == PressDevice::Mouse && right_held);
+    let pen = (left.device == PressDevice::Pen && left_held)
+        || (right.device == PressDevice::Pen && right_held);
+    (mouse, pen)
 }
 
 /// Первый позиционный аргумент — файл пака (`.deemopack`/`.zip`), который
@@ -475,7 +524,7 @@ pub struct App {
     x_tolerance: f32,
     /// мышь: абсолютная позиция курсора вместо относительного delta
     mouse_absolute: bool,
-    /// «Line cursor»: скрыть системный курсор в игре и рисовать два луча
+    /// «Hide cursor (1D aim)»: скрыть системный курсор в игре; без лучей
     line_cursor: bool,
     /// «RMB = pen press»: правая кнопка ведёт левую руку
     rmb_pen_press: bool,
@@ -1267,9 +1316,9 @@ impl App {
             .then(|| (p.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0))
     }
 
-    /// Правая кнопка при включённом «RMB = pen press»: нажатие судится как
-    /// палец/перо (планшетный оффсет, левая рука), удержание ведёт левый
-    /// слайд. Собственный press пера обрабатывается отдельно и игнорируется.
+    /// Правая кнопка в RMB-режиме: судит **правый** курсор (по его X и
+    /// устройству); удержание ведёт правый слайд. Собственный press пера
+    /// по-прежнему игнорируется.
     fn on_right_button(&mut self, pressed: bool) {
         let was = self.right_held;
         self.right_held = pressed;
@@ -1286,27 +1335,25 @@ impl App {
             _ => None,
         };
         let Some(t) = t else { return };
-        let aim = press_aim(true, self.pen_x(), self.mouse_x);
+        let (_, aim) = cursor_sides(self.mouse_x, self.pen_x());
         let (input_mouse, input_tablet) = self.input_offsets();
         let offset = if aim.tablet_offset { input_tablet } else { input_mouse };
         let tj = t + offset / 1000.0;
         let mut judge = None;
         let mut err = 0.0;
         if let Mode::Play { chart, play, paused: false, driver: None, .. } = &mut self.mode {
-            judge = play.tap(chart, tj, aim.x);
+            judge = apply_cursor_tap(play, chart, tj, aim, &mut self.hands);
             if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
                 err = play.errors.last().copied().unwrap_or(0.0) * 1000.0;
-                self.tablet_tap_errors.push(err);
-            }
-            if let Some(j) = judge {
                 match aim.device {
-                    PressDevice::Pen => self.hands.tablet.add(j),
-                    PressDevice::Mouse => self.hands.mouse.add(j),
+                    PressDevice::Pen => self.tablet_tap_errors.push(err),
+                    PressDevice::Mouse => self.mouse_tap_errors.push(err),
                 }
             }
         }
         if let Some(r) = &mut self.replay {
-            r.action(tj, 1, true, aim.x, judge, err);
+            let src = if aim.device == PressDevice::Pen { 1 } else { 0 };
+            r.action(tj, src, true, aim.x, judge, err);
         }
     }
 
@@ -1622,8 +1669,8 @@ impl App {
     }
 
     /// В игре: скрыть и захватить курсор (относительный ввод). В меню: показать.
-    /// В absolute-режиме без Line cursor курсор видимый и не захвачен
-    /// (клик прямо по колонке ноты). С Line cursor системный курсор скрыт в
+    /// В absolute-режиме без Hide cursor курсор видимый и не захвачен
+    /// (клик прямо по колонке ноты). С Hide cursor системный курсор скрыт в
     /// обоих режимах: иначе в absolute он уезжает за пером (libinput), пока
     /// игра целится мышью, и «двоится».
     fn set_play_cursor(&mut self, play: bool) {
@@ -1795,7 +1842,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(true) => {
                 // после alt-tab/старта окно могло вернуть системный курсор:
-                // в игре с Line cursor его быть не должно
+                // в игре с Hide cursor его быть не должно
                 if self.settings.is_none() && matches!(self.mode, Mode::Play { .. }) {
                     self.set_play_cursor(true);
                 }
@@ -2269,7 +2316,7 @@ impl App {
         let snap = self.snapshot_settings();
         self.settings = Some(SettingsScreen::new(snap, &self.online));
         // настройки — оконный UI: системный курсор нужен, даже если игра на
-        // паузе с Line cursor/относительным вводом
+        // паузе с Hide cursor/относительным вводом
         self.set_play_cursor(false);
         if check {
             self.start_packs_check();
@@ -2286,7 +2333,7 @@ impl App {
             self.online.state.server = server;
             self.online.save();
         }
-        // Line cursor could have been toggled while the settings overlay was
+        // Hide cursor could have been toggled while the settings overlay was
         // open over a paused play: apply hiding/showing immediately.
         self.set_play_cursor(matches!(self.mode, Mode::Play { .. }));
     }
@@ -2817,16 +2864,22 @@ impl App {
                 Mode::Play { clock, .. } => clock.current(),
                 _ => 0.0,
             };
-            let x = self.mouse_x;
-            // эффективный оффсет мыши = глобальная настройка + локальная карта
-            let (input_mouse, _) = self.input_offsets();
-            let tj = t + input_mouse / 1000.0;
+            // LMB — левый курсор: в обычном режиме мышь, в RMB-режиме тот
+            // из мыши/пера, который сейчас левее.
+            let aim = if self.rmb_pen_press {
+                cursor_sides(self.mouse_x, self.pen_x()).0
+            } else {
+                mouse_aim(self.mouse_x)
+            };
+            let (input_mouse, input_tablet) = self.input_offsets();
+            let offset = if aim.tablet_offset { input_tablet } else { input_mouse };
+            let tj = t + offset / 1000.0;
             let mut judge = None;
             let mut err_ms = 0.0;
             if let Mode::Play { chart, play, paused, driver, .. } = &mut self.mode {
                 // в просмотре реплея ввод выключен: клик не судит ноты
                 if !*paused && driver.is_none() {
-                    judge = play.tap(chart, tj, x);
+                    judge = apply_cursor_tap(play, chart, tj, aim, &mut self.hands);
                     // в выборку калибровки идут только попадания: у Miss
                     // `errors.last()` — это ошибка ПРЕДЫДУЩЕЙ ноты
                     if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
@@ -2835,14 +2888,14 @@ impl App {
                 }
             }
             if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
-                self.mouse_tap_errors.push(err_ms);
-            }
-            // статистика по рукам: каждый тап засчитывается своему устройству
-            if let Some(j) = judge {
-                self.hands.mouse.add(j);
+                match aim.device {
+                    PressDevice::Pen => self.tablet_tap_errors.push(err_ms),
+                    PressDevice::Mouse => self.mouse_tap_errors.push(err_ms),
+                }
             }
             if let Some(r) = &mut self.replay {
-                r.action(tj, 0, true, x, judge, err_ms);
+                let src = if aim.device == PressDevice::Pen { 1 } else { 0 };
+                r.action(tj, src, true, aim.x, judge, err_ms);
             }
             return;
         }
@@ -3005,7 +3058,6 @@ impl App {
         let held = self.left_held;
         let right_held = self.right_held;
         let rmb_pen = self.rmb_pen_press;
-        let slide_x = self.mouse_x;
         // Планшет: тап = по сырым press-edges (точное время/x), слайд = по
         // удержанию активного планшета. Gaomon и Parblo равноправны — берём
         // тот, который отчитывался последним (а не жёстко Parblo).
@@ -3019,6 +3071,13 @@ impl App {
         // эффективные оффсеты ввода: глобальные настройки + локальные карты
         // (одни и те же для тапов и слайдов обоих устройств)
         let (input_mouse, input_tablet) = self.input_offsets();
+        // RMB-режим: кнопки адресуют левый/правый курсор по X. В обычном
+        // режиме LMB — мышь, правая кнопка не судит.
+        let (left_aim, right_aim) = if rmb_pen {
+            cursor_sides(self.mouse_x, tablet_x)
+        } else {
+            (mouse_aim(self.mouse_x), mouse_aim(self.mouse_x))
+        };
         let mut to_result = None;
         let mut replay_done = false;
         if let Mode::Play { chart, play, paused, song, diff, clock, music_on, driver } = &mut self.mode {
@@ -3040,7 +3099,6 @@ impl App {
                 } else {
                     play.update(chart, t);
                     // раздельные оффсеты ввода: + сдвигает тап/слайд позже
-                    let tm = t + input_mouse / 1000.0;
                     let tt = t + input_tablet / 1000.0;
                     // сырой планшет в реплей + тапы по press-edges (без покадровой
                     // задержки); у каждого планшета СВОЙ prev_press
@@ -3083,10 +3141,21 @@ impl App {
                     self.gaomon_was_pressed = prev[0];
                     self.parblo_was_pressed = prev[1];
                     if held {
-                        let hit = play.slide(chart, tm, slide_x, self.speed);
+                        let offset = if left_aim.tablet_offset {
+                            input_tablet
+                        } else {
+                            input_mouse
+                        };
+                        let lt = t + offset / 1000.0;
+                        let hit = play.slide(chart, lt, left_aim.x, self.speed);
                         if hit {
                             if let Some(r) = &mut self.replay {
-                                r.action(tm, 0, false, slide_x, None, 0.0);
+                                let src = if left_aim.device == PressDevice::Pen {
+                                    1
+                                } else {
+                                    0
+                                };
+                                r.action(lt, src, false, left_aim.x, None, 0.0);
                             }
                         }
                     }
@@ -3100,14 +3169,24 @@ impl App {
                             }
                         }
                     }
-                    // RMB = pen: удержание правой кнопки ведёт левый слайд с
-                    // планшетным оффсетом; X — перо, иначе мышь
+                    // RMB: удержание правой кнопки ведёт правый курсор
+                    // (X/устройство по текущим позициям мыши и пера)
                     if rmb_pen && right_held {
-                        let px = tablet_x.unwrap_or(self.mouse_x);
-                        let hit = play.slide(chart, tt, px, self.speed);
+                        let offset = if right_aim.tablet_offset {
+                            input_tablet
+                        } else {
+                            input_mouse
+                        };
+                        let rt = t + offset / 1000.0;
+                        let hit = play.slide(chart, rt, right_aim.x, self.speed);
                         if hit {
                             if let Some(r) = &mut self.replay {
-                                r.action(tt, 1, false, px, None, 0.0);
+                                let src = if right_aim.device == PressDevice::Pen {
+                                    1
+                                } else {
+                                    0
+                                };
+                                r.action(rt, src, false, right_aim.x, None, 0.0);
                             }
                         }
                     }
@@ -3257,17 +3336,27 @@ impl App {
             // (оранжевая; Gaomon и Parblo — равноправно, кто говорил последним).
             // В просмотре реплея ввода нет — засечек тоже.
             if driver.is_none() {
-                if self.line_cursor {
-                    // два вертикальных луча, системного курсора нет; перо —
-                    // только если планшет присутствует
-                    crate::scene::push_live_cursor(&mut sprites, self.mouse_x, tablet_x);
-                } else {
-                    let half = crate::stage::note_x(2.0);
-                    sprites.push(crate::stage::marker(self.mouse_x, [0.3, 0.8, 1.0, 1.0], self.left_held));
-                    if let Some(p) = self.tablets.as_ref().and_then(|t| t.active_state()) {
-                        let x = (p.x_norm * 2.0 - 1.0) * half;
-                        sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
-                    }
+                // обычные игровые маркеры; Hide cursor — только скрытие
+                // системного курсора, новых визуалов в игре нет
+                let (mouse_press, pen_press) = cursor_marker_press(
+                    self.rmb_pen_press,
+                    self.mouse_x,
+                    tablet_x,
+                    self.left_held,
+                    self.right_held,
+                    tablet_press,
+                );
+                sprites.push(crate::stage::marker(
+                    self.mouse_x,
+                    [0.3, 0.8, 1.0, 1.0],
+                    mouse_press,
+                ));
+                if let Some(px) = tablet_x {
+                    sprites.push(crate::stage::marker(
+                        px,
+                        [1.0, 0.6, 0.2, 1.0],
+                        pen_press,
+                    ));
                 }
             } else if let Some(driver) = driver {
                 // курсор реплея: два вертикальных луча (левая/правая рука)
@@ -4292,20 +4381,33 @@ pub fn shot_screen(
             renderer.set_camera(&mvp);
             sprites = scene.sprites(t, width, height);
             screen_q[1].color = [1.0, 1.0, 1.0, scene.bg_mask_alpha(t)];
-            // screenshots may force the Line cursor and a synthetic pen X;
-            // production uses the same scene::push_live_cursor helper
-            let line_cursor = std::env::var("DEEMO_SHOT_LINE_CURSOR").is_ok();
+            // Screenshot-only fixture for the two-cursor RMB mapping. Normal
+            // gameplay uses the same helper in redraw().
+            if let Ok(x) = std::env::var("DEEMO_SHOT_MOUSE_X") {
+                if let Ok(x) = x.parse::<f32>() {
+                    app.mouse_x = crate::stage::note_x(x);
+                }
+            }
             let pen_x = std::env::var("DEEMO_SHOT_PEN_X")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
                 .map(crate::stage::note_x);
-            if line_cursor {
-                crate::scene::push_live_cursor(&mut sprites, app.mouse_x, pen_x);
-            } else {
-                sprites.push(crate::stage::marker(app.mouse_x, [0.3, 0.8, 1.0, 1.0], app.left_held));
-                if let Some(px) = pen_x {
-                    sprites.push(crate::stage::marker(px, [1.0, 0.6, 0.2, 1.0], false));
-                }
+            let rmb_mode = app.rmb_pen_press || std::env::var("DEEMO_SHOT_RMB_MODE").is_ok();
+            let lmb = app.left_held || std::env::var("DEEMO_SHOT_LMB").is_ok();
+            let rmb = app.right_held || std::env::var("DEEMO_SHOT_RMB").is_ok();
+            let (mouse_press, pen_press) =
+                cursor_marker_press(rmb_mode, app.mouse_x, pen_x, lmb, rmb, false);
+            sprites.push(crate::stage::marker(
+                app.mouse_x,
+                [0.3, 0.8, 1.0, 1.0],
+                mouse_press,
+            ));
+            if let Some(px) = pen_x {
+                sprites.push(crate::stage::marker(
+                    px,
+                    [1.0, 0.6, 0.2, 1.0],
+                    pen_press,
+                ));
             }
             app.draw_hud(&mut ui, *song, *diff, play, t, *paused, None);
         }
@@ -4538,7 +4640,7 @@ mod tests {
         }
     }
 
-    /// Line cursor в absolute-режиме обязан скрывать системный курсор
+    /// Hide cursor в absolute-режиме обязан скрывать системный курсор
     /// (иначе он «двоится» с пером); без опции — прежнее поведение.
     #[test]
     fn line_cursor_hides_the_system_cursor_in_both_modes() {
@@ -4550,24 +4652,107 @@ mod tests {
         assert!(!hide_system_cursor(false, true, true), "menu");
     }
 
-    /// RMB = pen: правая кнопка всегда считается левой рукой и берёт
-    /// планшетный оффсет; X — перо, если планшет есть, иначе мышь. LMB —
-    /// прежняя правая рука/мышь.
+    /// LMB/RMB в RMB-режиме адресуют левый/правый курсор по X; при равном X
+    /// левым считается мышь; без пера оба — мышь.
     #[test]
-    fn rmb_press_uses_the_left_hand_and_pen_x_when_present() {
-        use super::{press_aim, PressDevice};
-        let lmb = press_aim(false, Some(1.0), -2.0);
-        assert_eq!(lmb.device, PressDevice::Mouse);
-        assert_eq!(lmb.x, -2.0);
-        assert!(!lmb.tablet_offset);
-        let rmb_pen = press_aim(true, Some(1.0), -2.0);
-        assert_eq!(rmb_pen.device, PressDevice::Pen);
-        assert_eq!(rmb_pen.x, 1.0);
-        assert!(rmb_pen.tablet_offset);
-        let rmb_no_pen = press_aim(true, None, -2.0);
-        assert_eq!(rmb_no_pen.device, PressDevice::Pen);
-        assert_eq!(rmb_no_pen.x, -2.0);
-        assert!(rmb_no_pen.tablet_offset);
+    fn cursor_sides_follow_positions() {
+        use super::{cursor_sides, PressDevice};
+        let (left, right) = cursor_sides(-2.0, Some(1.0));
+        assert_eq!((left.device, left.x), (PressDevice::Mouse, -2.0));
+        assert_eq!((right.device, right.x), (PressDevice::Pen, 1.0));
+        assert!(!left.tablet_offset && right.tablet_offset);
+        let (left, right) = cursor_sides(1.0, Some(-1.0));
+        assert_eq!((left.device, left.x), (PressDevice::Pen, -1.0));
+        assert_eq!((right.device, right.x), (PressDevice::Mouse, 1.0));
+        // equal X: mouse is left
+        let (left, right) = cursor_sides(0.0, Some(0.0));
+        assert_eq!((left.device, left.x), (PressDevice::Mouse, 0.0));
+        assert_eq!((right.device, right.x), (PressDevice::Pen, 0.0));
+        // no pen: both mouse
+        let (left, right) = cursor_sides(-2.0, None);
+        assert_eq!((left.device, left.x), (PressDevice::Mouse, -2.0));
+        assert_eq!((right.device, right.x), (PressDevice::Mouse, -2.0));
+    }
+
+    /// В RMB-режиме LMB судит левый курсор: если перо левее, тап идёт по
+    /// X пера и засчитывается планшетной руке.
+    #[test]
+    fn lmb_taps_the_pen_when_the_pen_is_the_left_cursor() {
+        use super::{apply_cursor_tap, cursor_sides, PressDevice};
+        use crate::chart::{Chart, Note, NoteKind};
+        use crate::play::{Hands, Judge};
+        let chart = Chart {
+            speed: 6.0,
+            notes: vec![Note {
+                time: 1.0,
+                pos: -1.0,
+                size: 1.0,
+                speed: 1.0,
+                kind: NoteKind::Normal,
+                hold: 0.0,
+                sounds: vec![],
+            }],
+            links: vec![],
+        };
+        let mut play = crate::play::Play::new(&chart);
+        let pen_x = crate::stage::note_x(-1.0);
+        let (left, _) = cursor_sides(2.0, Some(pen_x));
+        assert_eq!(left.device, PressDevice::Pen);
+        let mut hands = Hands::default();
+        let j = apply_cursor_tap(&mut play, &chart, 1.0, left, &mut hands);
+        assert_eq!(j, Some(Judge::Perfect));
+        assert_eq!(hands.tablet.perfect, 1);
+        assert_eq!(hands.mouse.total(), 0);
+    }
+
+    /// Маркеры в RMB-режиме отражают кнопки, а не tip-press пера:
+    /// касание пера само press не даёт; LMB жмёт левый маркер, RMB — правый.
+    #[test]
+    fn cursor_marker_press_follows_buttons_in_rmb_mode() {
+        use super::cursor_marker_press;
+        // Pen left, mouse right.
+        assert_eq!(
+            cursor_marker_press(true, 2.0, Some(-1.0), false, false, true),
+            (false, false),
+            "pen tip alone must not press a marker"
+        );
+        assert_eq!(
+            cursor_marker_press(true, 2.0, Some(-1.0), true, false, true),
+            (false, true),
+            "LMB presses the left (pen) marker"
+        );
+        assert_eq!(
+            cursor_marker_press(true, 2.0, Some(-1.0), false, true, false),
+            (true, false),
+            "RMB presses the right (mouse) marker"
+        );
+        // Pen right, mouse left: mapping follows positions.
+        assert_eq!(
+            cursor_marker_press(true, -2.0, Some(1.0), true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            cursor_marker_press(true, -2.0, Some(1.0), false, true, false),
+            (false, true)
+        );
+        // No pen: either button presses the mouse marker.
+        assert_eq!(
+            cursor_marker_press(true, -2.0, None, true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            cursor_marker_press(true, -2.0, None, false, true, false),
+            (true, false)
+        );
+        // Normal mode keeps old semantics.
+        assert_eq!(
+            cursor_marker_press(false, 0.0, Some(1.0), true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            cursor_marker_press(false, 0.0, Some(1.0), false, false, true),
+            (false, true)
+        );
     }
 
     /// Детали открываются по строке и находят реплей строго по нику из

@@ -41,8 +41,11 @@ const MAX_TRACK_MS: u32 = 6 * 60 * 60 * 1000;
 pub const TRACK_INTERVAL: f32 = 0.060;
 /// Сэмпл сверх периода, если указатель ушёл на 0.1 pos от прошлого.
 pub const TRACK_POS_STEP: f32 = 0.1;
-/// Сколько после попадания луч держится ровно на `x_note` (press proof).
+/// Сколько после попадания маркер держится ровно на `x_note` (press proof).
 pub const CURSOR_HOLD: f32 = 0.05;
+/// Сколько после попадания маркер этой руки остаётся в pressed-состоянии
+/// (`stage::marker` шире и ярче), как при зажатой кнопке в игре.
+pub const MARKER_PRESS: f32 = 0.10;
 
 /// Версия разобранного блоба.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,8 +197,8 @@ impl ReplayBlob {
             pos += 2;
         }
         let (left, right) = if dmr2 {
-            // старый DMR2: единственный трек — левый луч
-            (decode_track(bytes, &mut pos)?, Vec::new())
+            // старый DMR2: единственный трек исторически мышиный → правый
+            (Vec::new(), decode_track(bytes, &mut pos)?)
         } else {
             // контракт DMR3: сначала правая рука, затем левая
             let right = decode_track(bytes, &mut pos)?;
@@ -454,8 +457,8 @@ pub struct ReplayDriver {
     left: Vec<TrackPoint>,
     right: Vec<TrackPoint>,
     has_cursor: bool,
-    /// Последнее реальное попадание: (hit_time, x_note, какой луч прилип).
-    last_hit: Option<HitSnap>,
+    /// Последнее реальное попадание на каждую руку (snap + press).
+    last_hits: [Option<HitSnap>; 2],
     cursor: usize,
 }
 
@@ -463,7 +466,13 @@ pub struct ReplayDriver {
 struct HitSnap {
     t: f32,
     x: f32,
-    side: BeamSide,
+}
+
+fn side_index(side: BeamSide) -> usize {
+    match side {
+        BeamSide::Left => 0,
+        BeamSide::Right => 1,
+    }
 }
 
 impl ReplayDriver {
@@ -505,7 +514,7 @@ impl ReplayDriver {
             left: blob.left.clone(),
             right: blob.right.clone(),
             has_cursor: blob.has_cursor(),
-            last_hit: None,
+            last_hits: [None, None],
             cursor: 0,
         })
     }
@@ -534,14 +543,14 @@ impl ReplayDriver {
         self.applied.get(i).copied().unwrap_or(false)
     }
 
-    /// X луча в chart pos: на кадре попадания прилипший луч стоит ровно на
-    /// `x_note` короткое время, остальные — интерполируются по своему треку.
+    /// X маркера в chart pos: на кадре попадания своей рукой маркер стоит
+    /// ровно на `x_note` короткое время; иначе — интерполяция своего трека.
     pub fn beam_x(&self, t: f32, side: BeamSide) -> Option<f32> {
         if !self.has_cursor {
             return None;
         }
-        if let Some(snap) = self.last_hit {
-            if snap.side == side && t >= snap.t && t <= snap.t + CURSOR_HOLD {
+        if let Some(snap) = self.last_hits[side_index(side)] {
+            if t >= snap.t && t <= snap.t + CURSOR_HOLD {
                 return Some(snap.x);
             }
         }
@@ -552,9 +561,13 @@ impl ReplayDriver {
         track_x(track, t)
     }
 
-    /// Какой луч прилип к последнему попаданию (для тестов/отладки).
-    pub fn snapped_side(&self) -> Option<BeamSide> {
-        self.last_hit.map(|h| h.side)
+    /// Позиция маркера и его pressed-состояние для конкретной руки.
+    pub fn marker_state(&self, t: f32, side: BeamSide) -> Option<(f32, bool)> {
+        let x = self.beam_x(t, side)?;
+        let pressed = self
+            .last_hits[side_index(side)]
+            .is_some_and(|s| t >= s.t && t <= s.t + MARKER_PRESS);
+        Some((x, pressed))
     }
 
     /// Применить все ноты, время которых наступило. Возвращает число
@@ -597,11 +610,7 @@ impl ReplayDriver {
                         (None, Some(_)) => BeamSide::Right,
                         (None, None) => BeamSide::Left,
                     };
-                    self.last_hit = Some(HitSnap {
-                        t: hit_time,
-                        x,
-                        side,
-                    });
+                    self.last_hits[side_index(side)] = Some(HitSnap { t: hit_time, x });
                 }
             }
             applied += 1;
@@ -1105,9 +1114,9 @@ mod tests {
         assert_eq!(back.left[1].x, q_to_pos(-3));
     }
 
-    /// Старый DMR2 (один трек) читается и становится левым лучом.
+    /// Старый DMR2 (один трек) читается как мышиный — правый маркер.
     #[test]
-    fn dmr2_single_track_decodes_as_the_left_beam() {
+    fn dmr2_single_track_decodes_as_the_mouse_marker() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"DMR2");
         bytes.extend_from_slice(&1u16.to_le_bytes());
@@ -1117,13 +1126,13 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 10, 0x40]);
         let blob = ReplayBlob::decode(&bytes).expect("old DMR2");
         assert_eq!(blob.format, ReplayFormat::Dmr2);
-        assert_eq!(blob.left.len(), 2);
-        assert!(blob.right.is_empty());
+        assert!(blob.left.is_empty());
+        assert_eq!(blob.right.len(), 2);
         let chart = chart_with(&[1.0]);
         let driver = ReplayDriver::new(&chart, &blob, "old").unwrap();
-        assert_eq!(driver.beam_x(0.0, BeamSide::Left), Some(0.0));
-        assert_eq!(driver.beam_x(10.0, BeamSide::Left), Some(q_to_pos(0x40)));
-        assert_eq!(driver.beam_x(0.0, BeamSide::Right), None);
+        assert_eq!(driver.beam_x(0.0, BeamSide::Right), Some(0.0));
+        assert_eq!(driver.beam_x(10.0, BeamSide::Right), Some(q_to_pos(0x40)));
+        assert_eq!(driver.beam_x(0.0, BeamSide::Left), None);
     }
 
     /// Хит с указателем за пределами сцены зажимается в [-2,2] pos; мисс
@@ -1265,20 +1274,57 @@ mod tests {
         let mut play = Play::new(&chart);
         driver.apply(&mut play, &chart, 1.0);
         let want = q_to_pos(pos_to_q(x_hit));
-        assert_eq!(driver.snapped_side(), Some(BeamSide::Right));
-        assert_eq!(driver.beam_x(1.0, BeamSide::Right), Some(want), "hit is exact");
-        assert_eq!(driver.beam_x(1.0, BeamSide::Left), Some(-2.0), "left keeps its track");
-        // после удержания right возвращается на интерполяцию 2 → −2
-        let t_after = 1.0 + CURSOR_HOLD + 0.01;
+        let (rx, rp) = driver.marker_state(1.0, BeamSide::Right).expect("right marker");
+        assert_eq!(rx, want, "hit is exact");
+        assert!(rp, "right marker is pressed on the hit frame");
+        let (lx, lp) = driver.marker_state(1.0, BeamSide::Left).expect("left marker");
+        assert_eq!(lx, -2.0, "left keeps its track");
+        assert!(!lp);
+        // pressed-окно шире snap-окна; после него маркер возвращается на трек
+        let t_after = 1.0 + MARKER_PRESS + 0.01;
+        assert!(!driver.marker_state(t_after, BeamSide::Right).unwrap().1);
         let want_after = 2.0 - 4.0 * ((t_after - 0.75) / 1.75);
         assert!((driver.beam_x(t_after, BeamSide::Right).unwrap() - want_after).abs() < 1e-5);
-        // мисс не двигает last_hit: к 2.3 прилипание давно кончилось
+        // мисс не двигает last_hits: к 2.3 прилипание давно кончилось
         driver.apply(&mut play, &chart, 2.3);
         assert_eq!(play.states[1].result, Judge::Miss);
-        assert_eq!(driver.snapped_side(), Some(BeamSide::Right));
         let after = driver.beam_x(2.3, BeamSide::Right).unwrap();
         assert!((after - -1.5428).abs() < 0.02, "right follows track: {after}");
         assert_eq!(driver.beam_x(2.3, BeamSide::Left), Some(-2.0));
+    }
+
+    /// Каждая рука ведёт свой маркер: попадание справа не двигает перо,
+    /// попадание слева не двигает мышь; pressed-окно у каждой руки своё.
+    #[test]
+    fn marker_state_is_per_track_and_has_its_own_press_window() {
+        let chart = chart_with(&[1.0, 1.5]);
+        let blob = ReplayBlob {
+            format: ReplayFormat::Dmr3,
+            notes: vec![
+                NoteShot { delta: 0, x: pos_to_q(0.0) },
+                NoteShot { delta: 0, x: pos_to_q(2.0) },
+            ],
+            right: vec![
+                TrackPoint { t: 0.5, x: 0.0 },
+                TrackPoint { t: 2.0, x: 0.0 },
+            ],
+            left: vec![
+                TrackPoint { t: 0.5, x: 2.0 },
+                TrackPoint { t: 2.0, x: 2.0 },
+            ],
+        };
+        let mut driver = ReplayDriver::new(&chart, &blob, "kid").unwrap();
+        let mut play = Play::new(&chart);
+        driver.apply(&mut play, &chart, 1.6);
+        let (rx, rp) = driver.marker_state(1.6, BeamSide::Right).unwrap();
+        let (lx, lp) = driver.marker_state(1.6, BeamSide::Left).unwrap();
+        assert_eq!(rx, 0.0, "right track keeps its mouse X");
+        assert!(!rp, "right press window (1.0..1.1) is over");
+        assert_eq!(lx, 2.0, "left marker follows the pen hit");
+        assert!(lp, "left marker is pressed on its hit");
+        // press window exactly 100 ms
+        assert!(driver.marker_state(1.0 + MARKER_PRESS, BeamSide::Right).unwrap().1);
+        assert!(!driver.marker_state(1.0 + MARKER_PRESS + 0.001, BeamSide::Right).unwrap().1);
     }
 
     /// Сквозной тест записи: hit → x_note в DMR3; после decode драйвер

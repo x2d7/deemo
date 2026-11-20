@@ -9,12 +9,26 @@ tablet is not listed, the pen simply does nothing today (the mouse still works).
 
 | Tablet | USB id | X range | Pressure | Notes |
 | --- | --- | --- | --- | --- |
-| Gaomon S620 | `256c:006d` | `0..26455` | `0..8191` | 12-byte reports; hover = pressure `0` |
+| Gaomon S620 | `256c:006d`, `256c:006f` | `0..26455` | `0..8191` | 12-byte reports; hover = pressure `0` |
 | Parblo Ninos N4 | `0483:a019` | `0..21597` | `0..4358` | 10-byte reports; hover/press flag in byte 1 (`0xA0` hover, `0xA1` press) |
 
 Both are used as the **left cursor** (the mouse drives the right one), and both
 can be connected at the same time — the game follows whichever one reported
 last.
+
+## Linux permissions
+
+`/dev/hidraw*` is root-only on most distributions, so the game cannot read the
+pen until it is allowed. Run once:
+
+```sh
+sudo scripts/install-udev.sh
+```
+
+The script grants the logged-in user access to the supported tablets and sets
+`LIBINPUT_IGNORE_DEVICE=1`, so the compositor ignores the pen: it moves only the
+game cursor and never the system cursor. Replug the tablet (or re-login) after
+running it. Remove `/etc/udev/rules.d/70-deemo-tablets.rules` to undo.
 
 ## Adding a tablet
 
