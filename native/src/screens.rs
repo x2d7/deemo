@@ -1270,7 +1270,7 @@ pub fn draw_play_detail(ctx: &Ctx, v: &PlayDetailView, ui: &mut Vec<UiQuad>) -> 
     text.draw_centered_tracked(Face::Serif, &sub, cx, y(88.0), z(10.0), 2.6 * k, INK_DIM, ui);
 
     // закрыть: единственная вторая кнопка экрана
-    let close_cap = "ЗАКРЫТЬ";
+    let close_cap = "CLOSE";
     let cw = text.measure(close_cap, z(10.0));
     let close_rect = [w - MARGIN * k - cw - 10.0 * k, y(8.0), cw + 10.0 * k, z(22.0)];
     text.draw(close_cap, close_rect[0] + 5.0 * k, close_rect[1] + 3.0 * k, z(10.0), INK_FAINT, ui);
@@ -1346,19 +1346,19 @@ pub fn draw_play_detail(ctx: &Ctx, v: &PlayDetailView, ui: &mut Vec<UiQuad>) -> 
         theme::fill(ui, white, watch_btn, PANEL);
         theme::frame(ui, white, watch_btn, [0.69, 0.44, 0.12, 0.72], k);
         theme::corner_ticks(ui, white, watch_btn, ACCENT, 12.0 * k, k);
-        text.draw_centered("СМОТРЕТЬ РЕПЛЕЙ", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_HI, ui);
+        text.draw_centered("WATCH REPLAY", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_HI, ui);
     } else {
         theme::fill(ui, white, watch_btn, [0.84, 0.80, 0.72, 0.02]);
         theme::frame(ui, white, watch_btn, RULE, k);
-        text.draw_centered("СМОТРЕТЬ РЕПЛЕЙ", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_FAINT, ui);
+        text.draw_centered("WATCH REPLAY", watch_btn[0] + watch_btn[2] * 0.5, watch_btn[1] + (watch_btn[3] - z(13.0)) * 0.5, z(13.0), INK_FAINT, ui);
         let reason = fit_simple(text, v.reason, watch_btn[2], z(10.0));
         text.draw_centered(&reason, cx, watch_btn[1] + watch_btn[3] + z(14.0), z(10.0), INK_FAINT, ui);
     }
 
     let hint = if v.can_watch {
-        "ESC / BACKSPACE — ЗАКРЫТЬ · ENTER — СМОТРЕТЬ"
+        "ESC / BACKSPACE — CLOSE · ENTER — WATCH"
     } else {
-        "ESC / BACKSPACE — ЗАКРЫТЬ"
+        "ESC / BACKSPACE — CLOSE"
     };
     text.draw_centered(hint, cx, h - oy - 56.0 * k, z(9.5), INK_FAINT, ui);
 

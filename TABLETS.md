@@ -11,10 +11,13 @@ tablet is not listed, the pen simply does nothing today (the mouse still works).
 | --- | --- | --- | --- | --- |
 | Gaomon S620 | `256c:006d`, `256c:006f` | `0..26455` | `0..8191` | 12-byte reports; hover = pressure `0` |
 | Parblo Ninos N4 | `0483:a019` | `0..21597` | `0..4358` | 10-byte reports; hover/press flag in byte 1 (`0xA0` hover, `0xA1` press) |
+| XP-Pen Star G640 | `28bd:0094`, `28bd:0914` | `0..31999` (`0..15998` on the 12-byte variant) | `0..8191` | OTD XP-Pen parser; the `0914` variant is chosen by report length |
+| XP-Pen Star G640S | `28bd:0906` | `0..32998` | `0..8191` | 10/12-byte reports |
 
-Both are used as the **left cursor** (the mouse drives the right one), and both
-can be connected at the same time — the game follows whichever one reported
-last.
+All of them are used as the **left cursor** (the mouse drives the right one),
+and several can be connected at the same time — the game follows whichever one
+reported last. XP-Pen reports at or out of range, init/idle reports and express
+key reports are ignored.
 
 ## Linux permissions
 

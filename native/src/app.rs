@@ -85,9 +85,9 @@ impl PlayDetail {
     /// Короткая причина, почему «СМОТРЕТЬ РЕПЛЕЙ» выключена.
     pub fn watch_reason(&self) -> &'static str {
         if self.record.nickname.trim().is_empty() {
-            "У записи нет ника — реплей не найти"
+            "This record has no nickname — no replay to find"
         } else {
-            "Реплея этого игрока на сервере нет"
+            "No replay from this player on the server"
         }
     }
 }
@@ -4520,7 +4520,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     if forced {
-        println!("backend: x11 (XWayland) — drag & drop доступен");
+        println!("backend: x11 (XWayland) — drag & drop available");
     }
     event_loop.set_control_flow(ControlFlow::Poll);
     // двойной клик по .deemopack: первый позиционный аргумент ставим тем же
@@ -4796,7 +4796,7 @@ mod tests {
         // ряд есть, реплея нет — детали всё равно открываются, watch выключен
         let d = detail_for_record(&rec, &[], None);
         assert!(!d.can_watch());
-        assert!(d.watch_reason().contains("Реплея"));
+        assert!(d.watch_reason().contains("No replay"));
         // чужой ник не подходит
         let d = detail_for_record(&rec, &[ReplayEntry { nick: "other".into(), ..replay }], None);
         assert!(!d.can_watch());

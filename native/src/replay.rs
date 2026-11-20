@@ -1161,7 +1161,7 @@ mod tests {
         no_ptr.states[0].hit_time = 1.0;
         no_ptr.states[0].pointer_x = f32::NAN;
         let fallback = dmr3_from_play(&chart, &no_ptr, &[], &[]).unwrap();
-        assert_eq!(fallback.notes[0].x, 0, "x ноты (pos 0)");
+        assert_eq!(fallback.notes[0].x, 0, "note x (pos 0)");
         assert_ne!(fallback.notes[0].x, DMR1_MISS);
 
         // DMR1: длина 6 + note_count, x нет, треков нет

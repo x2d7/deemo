@@ -12,6 +12,7 @@
 use crate::hid_desc::DigitizerLayout;
 use crate::tablet::{
     self, ProbeLog, Sink, Tablets, GAOMON_PRESS_THRESHOLD, GAOMON_VID, PARBLO_PID, PARBLO_VID,
+    XPPEN_PID_G640S_0906, XPPEN_PID_G640_0094, XPPEN_PID_G640_0914, XPPEN_VID,
 };
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::ffi::CStr;
@@ -27,7 +28,7 @@ struct Target {
     pid: Option<u16>,
 }
 
-const TARGETS: [Target; 2] = [
+const TARGETS: [Target; 5] = [
     Target {
         kind: "gaomon",
         vid: GAOMON_VID,
@@ -37,6 +38,22 @@ const TARGETS: [Target; 2] = [
         kind: "parblo",
         vid: PARBLO_VID,
         pid: Some(PARBLO_PID),
+    },
+    // Only these XP-Pen PIDs; other models use different report layouts.
+    Target {
+        kind: "xppen",
+        vid: XPPEN_VID,
+        pid: Some(XPPEN_PID_G640_0094),
+    },
+    Target {
+        kind: "xppen",
+        vid: XPPEN_VID,
+        pid: Some(XPPEN_PID_G640S_0906),
+    },
+    Target {
+        kind: "xppen",
+        vid: XPPEN_VID,
+        pid: Some(XPPEN_PID_G640_0914),
     },
 ];
 
@@ -97,6 +114,7 @@ pub(crate) fn spawn_tablets(tablets: &Tablets, zoom: f32, p_threshold: i32) {
             "gaomon" => GAOMON_PRESS_THRESHOLD,
             _ => p_threshold.max(0),
         };
+        let target_pid = target.pid.unwrap_or(0);
 
         // Сначала собрать дескрипторы и раскладки, затем открывать.
         let mut plans: Vec<(DeviceInfo, Option<DigitizerLayout>)> = Vec::new();
@@ -192,7 +210,7 @@ pub(crate) fn spawn_tablets(tablets: &Tablets, zoom: f32, p_threshold: i32) {
                     Mode::Digitizer(_) => "digitizer",
                 },
             );
-            let sink = tablets.sink(target.kind, zoom, threshold);
+            let sink = tablets.sink(target.kind, target_pid, zoom, threshold);
             let kind = target.kind;
             let usage = (info.usage_page(), info.usage());
             let vendor_seen = vendor_seen.clone();

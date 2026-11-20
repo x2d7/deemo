@@ -1178,7 +1178,7 @@ fn main() -> Result<()> {
                 println!("cover: {:?}", m.cover.map(|c| path.join(c).exists()));
                 println!("duration: {}", m.duration);
             }
-            None => println!("manifest_of -> None (pack.json не разобран)"),
+            None => println!("manifest_of -> None (pack.json not parsed)"),
         }
         return Ok(());
     }

@@ -1,10 +1,11 @@
 //! Прямое чтение планшетов. Linux — hidraw (без ML), Windows — hidapi
-//! (см. `tablet_win.rs`). Gaomon S620 + Parblo Ninos N4.
+//! (см. `tablet_win.rs`). Gaomon S620 + Parblo Ninos N4 + XP-Pen Star G640/G640S.
 //! Форматы vendor-репортов — из mread (driver/tablets). Берём X (ширина) и
 //! давление, Y игнорируем. Параллельно пишем сырой лог для калибровки.
 //!
 //! Данные калибровки: hover = давление 0 у обоих; press = давление > порога.
-//! Gaomon X≈26456, P 0..8191; Parblo X≈21598, P 0..4358 (hover-флаг byte1 0xA0/0xA1).
+//! Gaomon X≈26456, P 0..8191; Parblo X≈21598, P 0..4358 (hover-флаг byte1 0xA0/0xA1);
+//! XP-Pen G640 X=32000 (0x0914 variant 2: 15999), G640S X=32999, P 0..8191.
 //!
 //! Разбор vendor-байтов (`parse_report`) общий для обеих ОС: на Windows
 //! hidapi отдаёт те же репорты, что hidraw на Linux (плюс, возможно, байт
@@ -28,6 +29,18 @@ pub const GAOMON_VID: u16 = 0x256c;
 pub const GAOMON_PID: u16 = 0x006d;
 pub const PARBLO_VID: u16 = 0x0483;
 pub const PARBLO_PID: u16 = 0xa019;
+/// XP-Pen vendor; only the Star G640/G640S PIDs below are parsed. Other
+/// XP-Pen models have different report layouts and must not be opened as if
+/// they were G640.
+pub const XPPEN_VID: u16 = 0x28bd;
+pub const XPPEN_PID_G640_0094: u16 = 0x0094;
+pub const XPPEN_PID_G640S_0906: u16 = 0x0906;
+pub const XPPEN_PID_G640_0914: u16 = 0x0914;
+pub const XPPEN_PIDS: [u16; 3] = [
+    XPPEN_PID_G640_0094,
+    XPPEN_PID_G640S_0906,
+    XPPEN_PID_G640_0914,
+];
 
 /// Порог нажатия Gaomon: у него hover даёт p=0, контакт — тысячи.
 pub const GAOMON_PRESS_THRESHOLD: i32 = 40;
@@ -64,6 +77,7 @@ pub struct RawTabletEvent {
 pub struct Tablets {
     pub gaomon: Arc<Mutex<TabletState>>,
     pub parblo: Arc<Mutex<TabletState>>,
+    pub xppen: Arc<Mutex<TabletState>>,
     /// самый свежий репорт: (какой планшет, когда). Gaomon и Parblo равноправны:
     /// игра берёт активный планшет, а не жёстко Parblo.
     active: Arc<Mutex<Option<(&'static str, Instant)>>>,
@@ -153,11 +167,35 @@ pub fn pen_emulates_motion(
     })
 }
 
+/// Поддерживаем ли мы этот XP-Pen PID (другие модели не открываем).
+#[allow(dead_code)] // used by tests; the OS backends filter with XPPEN_PIDS directly
+pub fn xppen_supported_pid(pid: u16) -> bool {
+    XPPEN_PIDS.contains(&pid)
+}
+
+/// X_max XP-Pen: у G640 0x0914 две прошивки, различаемые длиной репорта
+/// (14 байт — 32000, 12 байт — 15999).
+pub fn xppen_x_max(pid: u16, report_len: usize) -> f32 {
+    match pid {
+        XPPEN_PID_G640_0094 => 32000.0,
+        XPPEN_PID_G640S_0906 => 32999.0,
+        XPPEN_PID_G640_0914 => {
+            if report_len >= 14 {
+                32000.0
+            } else {
+                15999.0
+            }
+        }
+        _ => 32000.0,
+    }
+}
+
 /// X_max конкретного планшета (для нормализации vendor-репорта).
-pub fn x_max_of(kind: &str) -> f32 {
+pub fn x_max_of(kind: &str, pid: u16, report_len: usize) -> f32 {
     match kind {
         "gaomon" => GAOMON_X_MAX,
         "parblo" => PARBLO_X_MAX,
+        "xppen" => xppen_x_max(pid, report_len),
         _ => 1.0,
     }
 }
@@ -212,6 +250,28 @@ pub fn parse_report(kind: &str, b: &[u8]) -> Option<(i32, i32, bool)> {
             let p = u16le(b, off + 6);
             Some((x, p, flag == 0xa0))
         }
+        "xppen" => {
+            // OTD XP_PenReportParser: first status byte in report[1].
+            if b.len() < 8 {
+                return None;
+            }
+            let status = b[1];
+            if status == 0xc0 || matches!(status, 0xb4 | 0xf2 | 0xf8) {
+                return None; // out of range / init / idle
+            }
+            if status & 0x10 != 0 {
+                return None; // auxiliary/express keys, not a pen sample
+            }
+            let x = if b.len() >= 12 {
+                u16le(b, 2) | (i32::from(b[10]) << 16)
+            } else if b.len() >= 10 || b.len() == 8 {
+                u16le(b, 2)
+            } else {
+                return None;
+            };
+            let p = u16le(b, 6);
+            Some((x, p, p == 0))
+        }
         _ => None,
     }
 }
@@ -221,6 +281,8 @@ pub fn parse_report(kind: &str, b: &[u8]) -> Option<(i32, i32, bool)> {
 #[derive(Clone)]
 pub(crate) struct Sink {
     kind: &'static str,
+    /// PID нужен XP-Pen для выбора X_max (у 0x0914 две прошивки).
+    pid: u16,
     state: Arc<Mutex<TabletState>>,
     active: Arc<Mutex<Option<(&'static str, Instant)>>>,
     last_report: Arc<Mutex<Option<Instant>>>,
@@ -238,7 +300,7 @@ impl Sink {
         let Some((x, p, hover)) = parse_report(self.kind, bytes) else {
             return false;
         };
-        let raw = (x as f32 / x_max_of(self.kind)).clamp(0.0, 1.0);
+        let raw = (x as f32 / x_max_of(self.kind, self.pid, bytes.len())).clamp(0.0, 1.0);
         let xn = ((raw - 0.5) * self.zoom + 0.5).clamp(0.0, 1.0);
         let press = !hover && p > self.press_threshold;
         self.emit(x, p, hover, press, xn, raw, bytes);
@@ -337,6 +399,7 @@ impl Tablets {
         let t = Tablets {
             gaomon: Arc::new(Mutex::new(TabletState::default())),
             parblo: Arc::new(Mutex::new(TabletState::default())),
+            xppen: Arc::new(Mutex::new(TabletState::default())),
             active: Arc::new(Mutex::new(None)),
             last_report: Arc::new(Mutex::new(None)),
             last_press: Arc::new(Mutex::new(None)),
@@ -355,13 +418,17 @@ impl Tablets {
         {
             let gaomon = find_nodes_any_pid(GAOMON_VID);
             let parblo = find_nodes(PARBLO_VID, PARBLO_PID);
+            let xppen = find_nodes_pids(XPPEN_VID, &XPPEN_PIDS);
             for node in &gaomon {
-                t.spawn_node(node, "gaomon", zoom, GAOMON_PRESS_THRESHOLD);
+                t.spawn_node(node, "gaomon", GAOMON_PID, zoom, GAOMON_PRESS_THRESHOLD);
             }
             for node in &parblo {
-                t.spawn_node(node, "parblo", zoom, pt);
+                t.spawn_node(node, "parblo", PARBLO_PID, zoom, pt);
             }
-            if gaomon.is_empty() && parblo.is_empty() {
+            for (node, pid) in &xppen {
+                t.spawn_node(node, "xppen", *pid, zoom, pt);
+            }
+            if gaomon.is_empty() && parblo.is_empty() && xppen.is_empty() {
                 println!("tablet: none found (hidraw on linux)");
             }
         }
@@ -369,13 +436,21 @@ impl Tablets {
     }
 
     /// Общий sink планшета; Windows-бэкенд обновляет через него состояние.
-    pub(crate) fn sink(&self, kind: &'static str, zoom: f32, press_threshold: i32) -> Sink {
+    pub(crate) fn sink(
+        &self,
+        kind: &'static str,
+        pid: u16,
+        zoom: f32,
+        press_threshold: i32,
+    ) -> Sink {
         let state = match kind {
             "gaomon" => self.gaomon.clone(),
+            "xppen" => self.xppen.clone(),
             _ => self.parblo.clone(),
         };
         Sink {
             kind,
+            pid,
             state,
             active: self.active.clone(),
             last_report: self.last_report.clone(),
@@ -394,6 +469,7 @@ impl Tablets {
         &self,
         node: &str,
         kind: &'static str,
+        pid: u16,
         zoom: f32,
         press_threshold: i32,
     ) {
@@ -407,12 +483,13 @@ impl Tablets {
                 return;
             }
         };
-        let (vid, pid) = match kind {
-            "gaomon" => (GAOMON_VID, GAOMON_PID),
-            _ => (PARBLO_VID, PARBLO_PID),
+        let vid = match kind {
+            "gaomon" => GAOMON_VID,
+            "xppen" => XPPEN_VID,
+            _ => PARBLO_VID,
         };
         println!("tablet: {kind} {vid:04x}:{pid:04x} opened ({node})");
-        let sink = self.sink(kind, zoom, press_threshold);
+        let sink = self.sink(kind, pid, zoom, press_threshold);
         std::thread::spawn(move || {
             let mut buf = [0u8; 64];
             loop {
@@ -434,6 +511,9 @@ impl Tablets {
     pub fn parblo(&self) -> TabletState {
         *self.parblo.lock().unwrap()
     }
+    pub fn xppen(&self) -> TabletState {
+        *self.xppen.lock().unwrap()
+    }
     /// Самый свежий планшет, если он отчитывался не позже [`ACTIVE_TTL`].
     pub fn active(&self) -> Option<&'static str> {
         let guard = self.active.lock().ok()?;
@@ -447,6 +527,7 @@ impl Tablets {
         match kind {
             "gaomon" => self.gaomon(),
             "parblo" => self.parblo(),
+            "xppen" => self.xppen(),
             _ => TabletState::default(),
         }
     }
@@ -592,13 +673,17 @@ fn probe_hidraw(seconds: f32) -> anyhow::Result<()> {
                 Some((node.clone(), "gaomon"))
             } else if vid == "0483" && pid == "a019" {
                 Some((node.clone(), "parblo"))
+            } else if vid == "28bd" && matches!(pid.as_str(), "0094" | "0906" | "0914") {
+                Some((node.clone(), "xppen"))
             } else {
                 None
             }
         })
         .collect();
     if targets.is_empty() {
-        log.line("no deemo tablet hidraw nodes (gaomon 256c:006d / parblo 0483:a019)");
+        log.line(
+            "no deemo tablet hidraw nodes (gaomon 256c / parblo 0483:a019 / xppen 28bd:0094,0906,0914)",
+        );
     }
 
     log.line("-- raw reports (up to 20 per node, ms since probe start) --");
@@ -691,6 +776,29 @@ fn find_nodes_any_pid(vid: u16) -> Vec<String> {
     out
 }
 
+/// Like [`find_nodes_any_pid`], but only the given product IDs. Used for
+/// XP-Pen: unrelated models of the same vendor must not be opened because
+/// their reports cannot be parsed as G640/G640S.
+#[cfg(not(windows))]
+fn find_nodes_pids(vid: u16, pids: &[u16]) -> Vec<(String, u16)> {
+    let vid = format!("{vid:04x}");
+    let wanted: Vec<String> = pids.iter().map(|p| format!("{p:04x}")).collect();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/hidraw") {
+        for e in rd.flatten() {
+            let node = format!("/dev/{}", e.file_name().to_string_lossy());
+            let (v, p) = vidpid(&node);
+            if v == vid {
+                if let Some((i, _)) = wanted.iter().enumerate().find(|(_, w)| w.as_str() == p) {
+                    out.push((node, pids[i]));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg(not(windows))]
 fn find_nodes(vid: u16, pid: u16) -> Vec<String> {
     let vid = format!("{vid:04x}");
@@ -712,8 +820,10 @@ fn find_nodes(vid: u16, pid: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PEN_REPORT_GRACE, PEN_X_TOLERANCE, TabletState, pen_emulates_motion, pen_emulates_mouse, pen_matches_cursor,
-        parse_report, report_is_fresh,
+        PEN_REPORT_GRACE, PEN_X_TOLERANCE, TabletState, XPPEN_PID_G640S_0906,
+        XPPEN_PID_G640_0094, XPPEN_PID_G640_0914,
+        pen_emulates_motion, pen_emulates_mouse, pen_matches_cursor, parse_report,
+        report_is_fresh, x_max_of, xppen_supported_pid, xppen_x_max,
     };
     use std::time::{Duration, Instant};
 
@@ -738,6 +848,17 @@ mod tests {
         b[1] = flag;
         b[2..4].copy_from_slice(&x.to_le_bytes());
         b[6..8].copy_from_slice(&p.to_le_bytes());
+        b
+    }
+
+    fn xppen(len: usize, status: u8, x: u16, p: u16, high: u8) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        b[1] = status;
+        b[2..4].copy_from_slice(&x.to_le_bytes());
+        b[6..8].copy_from_slice(&p.to_le_bytes());
+        if len >= 12 {
+            b[10] = high;
+        }
         b
     }
 
@@ -886,6 +1007,69 @@ mod tests {
         let press = parse_report("gaomon", &hex("0885d0340100ff1f00000000"))
             .expect("press report");
         assert_eq!(press, (13520, 8191, false));
+    }
+
+    /// XP-Pen Star G640/G640S: 8/10/12/14-byte reports; len>=12 carries high
+    /// X bits in report[10] (OTD XP_PenReportParser).
+    #[test]
+    fn xppen_reports_parse_all_four_lengths() {
+        assert_eq!(
+            parse_report("xppen", &xppen(8, 0x00, 1234, 500, 0)),
+            Some((1234, 500, false))
+        );
+        assert_eq!(
+            parse_report("xppen", &xppen(10, 0x02, 20000, 0, 0)),
+            Some((20000, 0, true))
+        );
+        let high = 65536 + 1234;
+        assert_eq!(
+            parse_report("xppen", &xppen(12, 0x00, 1234, 8191, 1)),
+            Some((high, 8191, false))
+        );
+        let high2 = 2 * 65536 + 777;
+        assert_eq!(
+            parse_report("xppen", &xppen(14, 0x00, 777, 42, 2)),
+            Some((high2, 42, false))
+        );
+    }
+
+    /// Out-of-range, init/idle and express-key reports are not pen samples.
+    #[test]
+    fn xppen_rejects_out_of_range_idle_and_aux_reports() {
+        for status in [0xc0, 0xb4, 0xf2, 0xf8, 0x10, 0x18, 0x30] {
+            assert_eq!(
+                parse_report("xppen", &xppen(12, status, 100, 500, 0)),
+                None,
+                "status {status:02x}"
+            );
+        }
+        // shorter than the 8-byte minimum is not a report
+        assert_eq!(parse_report("xppen", &[0u8; 7]), None);
+    }
+
+    /// 0x0914 is two firmware variants; report length selects the X range.
+    #[test]
+    fn xppen_x_max_depends_on_pid_and_report_length() {
+        assert_eq!(xppen_x_max(XPPEN_PID_G640_0094, 8), 32000.0);
+        assert_eq!(xppen_x_max(XPPEN_PID_G640_0914, 14), 32000.0);
+        assert_eq!(xppen_x_max(XPPEN_PID_G640_0914, 12), 15999.0);
+        assert_eq!(xppen_x_max(XPPEN_PID_G640S_0906, 10), 32999.0);
+        assert_eq!(xppen_x_max(XPPEN_PID_G640S_0906, 12), 32999.0);
+        assert_eq!(x_max_of("xppen", XPPEN_PID_G640_0914, 14), 32000.0);
+        assert_eq!(x_max_of("xppen", XPPEN_PID_G640_0914, 12), 15999.0);
+        assert_eq!(x_max_of("gaomon", 0, 12), super::GAOMON_X_MAX);
+        assert_eq!(x_max_of("parblo", 0, 10), super::PARBLO_X_MAX);
+    }
+
+    /// Only the three known XP-Pen PIDs are accepted; other models are not.
+    #[test]
+    fn xppen_matches_only_supported_pids() {
+        for pid in [0x0094, 0x0906, 0x0914] {
+            assert!(xppen_supported_pid(pid));
+        }
+        for pid in [0x0001, 0x0935, 0x0905, 0xffff] {
+            assert!(!xppen_supported_pid(pid), "{pid:04x}");
+        }
     }
 
     #[test]
