@@ -133,6 +133,18 @@ pub fn pen_emulates_mouse(
     if !(press_recently || pen_down) {
         return false;
     }
+    pen_emulates_motion(report, cursor_x, width)
+}
+
+/// Движение системного курсора, сгенерированное пером, — независимо от того,
+/// нажато ли перо. `report` уже отфильтрован по свежести: пока перо шлёт
+/// отчёты (в том числе hover), libinput двигает системный курсор, и игровая
+/// мышь не должна прыгать за ним. Настоящая мышь в другой точке проходит.
+pub fn pen_emulates_motion(
+    report: Option<TabletState>,
+    cursor_x: f32,
+    width: f32,
+) -> bool {
     report.is_some_and(|st| {
         st.present && pen_matches_cursor(st.x_norm, cursor_x, width, PEN_X_TOLERANCE)
     })
@@ -665,7 +677,7 @@ fn find_nodes(vid: u16, pid: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PEN_REPORT_GRACE, PEN_X_TOLERANCE, TabletState, pen_emulates_mouse, pen_matches_cursor,
+        PEN_REPORT_GRACE, PEN_X_TOLERANCE, TabletState, pen_emulates_motion, pen_emulates_mouse, pen_matches_cursor,
         parse_report, report_is_fresh,
     };
     use std::time::{Duration, Instant};
@@ -711,6 +723,18 @@ mod tests {
     }
 
     /// Эмуляция пера всегда приходит в его координате — её и глушим.
+    /// Свежий hover-отчёт (без нажатия) у позиции пера тоже должен глушить
+    /// движение курсора; обычная мышь в другой точке — нет.
+    #[test]
+    fn recent_pen_hover_motion_is_ignored() {
+        let p = pen(0.5);
+        assert!(pen_emulates_motion(Some(p), 0.5 * 1280.0, 1280.0));
+        assert!(!pen_emulates_motion(None, 0.5 * 1280.0, 1280.0));
+        assert!(!pen_emulates_motion(Some(p), 0.2 * 1280.0, 1280.0));
+        // press-фильтр кликов не изменился: hover без нажатия клик не глушит
+        assert!(!pen_emulates_mouse(false, false, Some(p), 0.5 * 1280.0, 1280.0));
+    }
+
     #[test]
     fn pen_emulation_at_the_pen_position_is_filtered() {
         let w = 1280.0;

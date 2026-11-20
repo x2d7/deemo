@@ -217,12 +217,55 @@ pub fn queue_toast(immediate: bool, uploaded: usize, still_queued: bool) -> Opti
     }
 }
 
+/// Скрывать ли системный курсор: в игре — всегда при Line cursor, иначе
+/// только в относительном режиме (как раньше). В меню — показывать.
+pub fn hide_system_cursor(play: bool, line_cursor: bool, mouse_absolute: bool) -> bool {
+    play && (line_cursor || !mouse_absolute)
+}
+
+/// Какая рука и какая X у нажатия. Для обычной мыши — правая рука/мышь;
+/// при `rmb_pen_press` правая кнопка всегда считается левой рукой (планшетный
+/// оффсет), а X берётся у пера, если планшет вообще присутствует.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PressDevice {
+    Mouse,
+    Pen,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PressAim {
+    pub device: PressDevice,
+    pub x: f32,
+    /// Нажатие использует планшетный оффсет (левая рука).
+    pub tablet_offset: bool,
+}
+
+pub fn press_aim(rmb_pen_press: bool, pen_x: Option<f32>, mouse_x: f32) -> PressAim {
+    if rmb_pen_press {
+        PressAim {
+            device: PressDevice::Pen,
+            x: pen_x.unwrap_or(mouse_x),
+            tablet_offset: true,
+        }
+    } else {
+        PressAim {
+            device: PressDevice::Mouse,
+            x: mouse_x,
+            tablet_offset: false,
+        }
+    }
+}
+
 /// Первый позиционный аргумент — файл пака (`.deemopack`/`.zip`), который
 /// надо поставить при старте, как drag & drop. Флаги (`-…`) и чужие пути
 /// игнорируются молча: `deemo --x11 song.chart.json` остаётся обычным запуском.
 pub fn pack_path_from_args(args: &[String]) -> Option<std::path::PathBuf> {
     let arg = args.iter().skip(1).find(|a| !a.starts_with('-'))?;
-    let path = std::path::Path::new(arg);
+    let path = if arg.starts_with("file://") {
+        file_uri_to_path(arg)?
+    } else {
+        std::path::PathBuf::from(arg)
+    };
     if !path.is_file() {
         return None;
     }
@@ -232,10 +275,55 @@ pub fn pack_path_from_args(args: &[String]) -> Option<std::path::PathBuf> {
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "deemopack" || ext == "zip" {
-        Some(path.to_path_buf())
+        Some(path)
     } else {
         None
     }
+}
+
+/// `file:///path%20with%20spaces` → локальный путь. Для `file://localhost/...`
+/// хост отбрасывается; на Windows ведущий `/` перед `C:` снимается.
+pub fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let mut decoded = percent_decode(rest);
+    #[cfg(windows)]
+    {
+        let b = decoded.as_bytes();
+        if b.first() == Some(&b'/')
+            && b.get(1).is_some_and(|c| c.is_ascii_alphabetic())
+            && b.get(2) == Some(&b':')
+        {
+            decoded.remove(0);
+        }
+    }
+    Some(std::path::PathBuf::from(decoded))
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| -> Option<u8> {
+                match c {
+                    b'0'..=b'9' => Some(c - b'0'),
+                    b'a'..=b'f' => Some(c - b'a' + 10),
+                    b'A'..=b'F' => Some(c - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Тост об успешной загрузке: с pp, если сервер его прислал
@@ -387,6 +475,10 @@ pub struct App {
     x_tolerance: f32,
     /// мышь: абсолютная позиция курсора вместо относительного delta
     mouse_absolute: bool,
+    /// «Line cursor»: скрыть системный курсор в игре и рисовать два луча
+    line_cursor: bool,
+    /// «RMB = pen press»: правая кнопка ведёт левую руку
+    rmb_pen_press: bool,
     /// раздельные оффсеты ввода (мс): + сдвигает тап позже
     mouse_offset_ms: f32,
     tablet_offset_ms: f32,
@@ -415,6 +507,8 @@ pub struct App {
     last_queue_flush: Instant,
     music_ended_at: Option<Instant>,
     left_held: bool,
+    /// правая кнопка: источник левой руки при `rmb_pen_press`
+    right_held: bool,
     /// игровой курсор мыши (мировой X на линии), двигается по delta X
     mouse_x: f32,
     cursor_grabbed: bool,
@@ -451,6 +545,9 @@ pub struct App {
     sbar_track: Option<[f32; 4]>,
     sbar_thumb: Option<[f32; 4]>,
     sbar_drag: Option<f32>, // смещение курсора внутри ползунка (px)
+    /// сырая позиция системного курсора (может двигаться пером); для
+    /// фильтра pen-emulated кликов, но не для прицеливания/UI
+    system_cursor: [f32; 2],
     saved_selected: Option<Entry>,
     /// запись реплея (сырой ввод) во время игры
     replay: Option<crate::replay::Replay>,
@@ -570,6 +667,8 @@ impl App {
             note_guides: settings.note_guides,
             x_tolerance: settings.x_tolerance,
             mouse_absolute: settings.mouse_absolute,
+            line_cursor: settings.line_cursor,
+            rmb_pen_press: settings.rmb_pen_press,
             mouse_offset_ms: settings.mouse_offset_ms,
             tablet_offset_ms: settings.tablet_offset_ms,
             tablet_press_threshold: settings.tablet_press_threshold,
@@ -583,6 +682,7 @@ impl App {
             last_queue_flush: Instant::now(),
             music_ended_at: None,
             left_held: false,
+            right_held: false,
             mouse_x: 0.0,
             cursor_grabbed: false,
             pending_play,
@@ -610,6 +710,7 @@ impl App {
             sbar_track: None,
             sbar_thumb: None,
             sbar_drag: None,
+            system_cursor: [0.0, 0.0],
             saved_selected: None,
             replay: None,
             toast: None,
@@ -836,6 +937,7 @@ impl App {
         // песни давал бы фантомный тап в начале новой
         self.gaomon_was_pressed = false;
         self.parblo_was_pressed = false;
+        self.right_held = false;
         self.set_play_cursor(true);
         Ok(())
     }
@@ -1140,6 +1242,72 @@ impl App {
             x,
             w as f32,
         )
+    }
+
+    /// Движение системного курсора от пера: глушим при любом свежем отчёте,
+    /// даже hover (перо — игровое устройство, а не вторая мышь). Клики
+    /// по-прежнему фильтруются press-состоянием в [`Self::pen_emulated_mouse_at`].
+    fn pen_emulated_motion_at(&self, x: f32) -> bool {
+        let Some(tablets) = self.tablets.as_ref() else {
+            return false;
+        };
+        let (w, _) = self.size();
+        crate::tablet::pen_emulates_motion(
+            tablets.pen_report_within(crate::tablet::PEN_REPORT_GRACE),
+            x,
+            w as f32,
+        )
+    }
+
+    /// Живая X пера на судейской линии (мировые единицы), если планшет
+    /// присутствует — даже при hover. None — пера нет.
+    fn pen_x(&self) -> Option<f32> {
+        let p = self.tablets.as_ref()?.active_state()?;
+        p.present
+            .then(|| (p.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0))
+    }
+
+    /// Правая кнопка при включённом «RMB = pen press»: нажатие судится как
+    /// палец/перо (планшетный оффсет, левая рука), удержание ведёт левый
+    /// слайд. Собственный press пера обрабатывается отдельно и игнорируется.
+    fn on_right_button(&mut self, pressed: bool) {
+        let was = self.right_held;
+        self.right_held = pressed;
+        if !self.rmb_pen_press || self.settings.is_some() {
+            return;
+        }
+        if !pressed || was {
+            return;
+        }
+        let t = match &self.mode {
+            Mode::Play { clock, paused: false, driver: None, .. } => {
+                Some(clock.wall_to_time(Instant::now()))
+            }
+            _ => None,
+        };
+        let Some(t) = t else { return };
+        let aim = press_aim(true, self.pen_x(), self.mouse_x);
+        let (input_mouse, input_tablet) = self.input_offsets();
+        let offset = if aim.tablet_offset { input_tablet } else { input_mouse };
+        let tj = t + offset / 1000.0;
+        let mut judge = None;
+        let mut err = 0.0;
+        if let Mode::Play { chart, play, paused: false, driver: None, .. } = &mut self.mode {
+            judge = play.tap(chart, tj, aim.x);
+            if matches!(judge, Some(Judge::Perfect) | Some(Judge::Good)) {
+                err = play.errors.last().copied().unwrap_or(0.0) * 1000.0;
+                self.tablet_tap_errors.push(err);
+            }
+            if let Some(j) = judge {
+                match aim.device {
+                    PressDevice::Pen => self.hands.tablet.add(j),
+                    PressDevice::Mouse => self.hands.mouse.add(j),
+                }
+            }
+        }
+        if let Some(r) = &mut self.replay {
+            r.action(tj, 1, true, aim.x, judge, err);
+        }
     }
 
     fn to_library(&mut self) {
@@ -1454,15 +1622,24 @@ impl App {
     }
 
     /// В игре: скрыть и захватить курсор (относительный ввод). В меню: показать.
-    /// В absolute-режиме курсор видимый и не захвачен (клик прямо по колонке ноты).
+    /// В absolute-режиме без Line cursor курсор видимый и не захвачен
+    /// (клик прямо по колонке ноты). С Line cursor системный курсор скрыт в
+    /// обоих режимах: иначе в absolute он уезжает за пером (libinput), пока
+    /// игра целится мышью, и «двоится».
     fn set_play_cursor(&mut self, play: bool) {
         let Some(g) = self.gfx.as_ref() else {
             return;
         };
-        if play && !self.mouse_absolute {
-            let _ = g.window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
-            g.window.set_cursor_visible(false);
-            self.cursor_grabbed = true;
+        if play {
+            if self.mouse_absolute {
+                let _ = g.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                self.cursor_grabbed = false;
+            } else {
+                let _ = g.window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+                self.cursor_grabbed = true;
+            }
+            g.window
+                .set_cursor_visible(!hide_system_cursor(true, self.line_cursor, self.mouse_absolute));
         } else {
             let _ = g.window.set_cursor_grab(winit::window::CursorGrabMode::None);
             g.window.set_cursor_visible(true);
@@ -1583,10 +1760,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Сырая позиция нужна фильтру pen-emulated кликов: перо
+                // двигает системный курсор в своей координате.
+                self.system_cursor = [position.x as f32, position.y as f32];
                 // Перо двигает системный курсор в своей координате — такое
                 // движение игнорируем. Мышь в любой другой точке проходит:
                 // у пера и мыши два независимых курсора.
-                if !self.pen_emulated_mouse_at(position.x as f32) {
+                if !self.pen_emulated_motion_at(position.x as f32) {
                     self.cursor = [position.x as f32, position.y as f32];
                 }
                 if self.sbar_drag.is_some() && self.left_held {
@@ -1613,40 +1793,53 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => {
                 self.key_mods = m.state();
             }
+            WindowEvent::Focused(true) => {
+                // после alt-tab/старта окно могло вернуть системный курсор:
+                // в игре с Line cursor его быть не должно
+                if self.settings.is_none() && matches!(self.mode, Mode::Play { .. }) {
+                    self.set_play_cursor(true);
+                }
+            }
             WindowEvent::HoveredFile(_) => {
                 self.toast = Some(("Drop .deemopack or a pack folder to install".into(), Instant::now()));
             }
             WindowEvent::HoveredFileCancelled => {}
             WindowEvent::DroppedFile(path) => self.on_drop_file(path),
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 // Перо дублирует мышь через libinput/OTD. Свежий нажим пера,
                 // нажатое перо или курсор рядом с пером — значит клик пришёл
-                // от пера: не трогаем left_held, on_click и реплей.
-                if self.pen_emulated_mouse_at(self.cursor[0]) {
+                // от пера: не трогаем кнопки, on_click и реплей.
+                if self.pen_emulated_mouse_at(self.system_cursor[0]) {
                     return;
                 }
-                self.left_held = state == ElementState::Pressed;
-                let t = match &self.mode {
-                    Mode::Play { clock, .. } => Some(clock.wall_to_time(Instant::now())),
-                    _ => None,
-                };
-                if self.settings.is_none() {
-                    if let (Some(t), Some(r)) = (t, &mut self.replay) {
-                        r.mouse_button(t, self.left_held, self.mouse_x);
+                match button {
+                    MouseButton::Left => {
+                        self.left_held = state == ElementState::Pressed;
+                        let t = match &self.mode {
+                            Mode::Play { clock, .. } => {
+                                Some(clock.wall_to_time(Instant::now()))
+                            }
+                            _ => None,
+                        };
+                        if self.settings.is_none() {
+                            if let (Some(t), Some(r)) = (t, &mut self.replay) {
+                                r.mouse_button(t, self.left_held, self.mouse_x);
+                            }
+                        }
+                        if self.left_held {
+                            // скроллбар ловит мышь первым: тянуть ползунок важнее,
+                            // чем выбрать песню под ним
+                            if !self.sbar_press() {
+                                self.on_click();
+                            }
+                        } else {
+                            self.sbar_drag = None;
+                        }
                     }
-                }
-                if self.left_held {
-                    // скроллбар ловит мышь первым: тянуть ползунок важнее,
-                    // чем выбрать песню под ним
-                    if !self.sbar_press() {
-                        self.on_click();
+                    MouseButton::Right => {
+                        self.on_right_button(state == ElementState::Pressed);
                     }
-                } else {
-                    self.sbar_drag = None;
+                    _ => {}
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1976,6 +2169,8 @@ impl App {
             note_guides: self.note_guides,
             x_tolerance: self.x_tolerance,
             mouse_absolute: self.mouse_absolute,
+            line_cursor: self.line_cursor,
+            rmb_pen_press: self.rmb_pen_press,
             mouse_offset_ms: self.mouse_offset_ms,
             tablet_offset_ms: self.tablet_offset_ms,
             tablet_press_threshold: self.tablet_press_threshold,
@@ -2021,6 +2216,8 @@ impl App {
         self.note_guides = s.note_guides;
         self.x_tolerance = s.x_tolerance;
         self.mouse_absolute = s.mouse_absolute;
+        self.line_cursor = s.line_cursor;
+        self.rmb_pen_press = s.rmb_pen_press;
         self.mouse_offset_ms = s.mouse_offset_ms;
         self.tablet_offset_ms = s.tablet_offset_ms;
         self.tablet_press_threshold = s.tablet_press_threshold;
@@ -2071,6 +2268,9 @@ impl App {
         }
         let snap = self.snapshot_settings();
         self.settings = Some(SettingsScreen::new(snap, &self.online));
+        // настройки — оконный UI: системный курсор нужен, даже если игра на
+        // паузе с Line cursor/относительным вводом
+        self.set_play_cursor(false);
         if check {
             self.start_packs_check();
         }
@@ -2086,6 +2286,9 @@ impl App {
             self.online.state.server = server;
             self.online.save();
         }
+        // Line cursor could have been toggled while the settings overlay was
+        // open over a paused play: apply hiding/showing immediately.
+        self.set_play_cursor(matches!(self.mode, Mode::Play { .. }));
     }
 
     fn on_key_settings(&mut self, key: Key) {
@@ -2800,6 +3003,8 @@ impl App {
 
         // обновление игры (сглаженные часы + lead-in)
         let held = self.left_held;
+        let right_held = self.right_held;
+        let rmb_pen = self.rmb_pen_press;
         let slide_x = self.mouse_x;
         // Планшет: тап = по сырым press-edges (точное время/x), слайд = по
         // удержанию активного планшета. Gaomon и Parblo равноправны — берём
@@ -2850,7 +3055,9 @@ impl App {
                             "parblo" => 1,
                             _ => continue,
                         };
-                        if tap_edge(&mut prev[slot], e.press) {
+                        // собственный press пера игнорируется при RMB = pen:
+                        // левая рука идёт с правой кнопки мыши
+                        if tap_edge(&mut prev[slot], e.press) && !rmb_pen {
                             let px = (e.x_norm * 2.0 - 1.0) * crate::stage::note_x(2.0);
                             let tj = et + input_tablet / 1000.0;
                             let j = play.tap(chart, tj, px);
@@ -2883,13 +3090,24 @@ impl App {
                             }
                         }
                     }
-                    if tablet_press {
+                    if tablet_press && !rmb_pen {
                         if let Some(px) = tablet_x {
                             let hit = play.slide(chart, tt, px, self.speed);
                             if hit {
                                 if let Some(r) = &mut self.replay {
                                     r.action(tt, 1, false, px, None, 0.0);
                                 }
+                            }
+                        }
+                    }
+                    // RMB = pen: удержание правой кнопки ведёт левый слайд с
+                    // планшетным оффсетом; X — перо, иначе мышь
+                    if rmb_pen && right_held {
+                        let px = tablet_x.unwrap_or(self.mouse_x);
+                        let hit = play.slide(chart, tt, px, self.speed);
+                        if hit {
+                            if let Some(r) = &mut self.replay {
+                                r.action(tt, 1, false, px, None, 0.0);
                             }
                         }
                     }
@@ -3039,11 +3257,17 @@ impl App {
             // (оранжевая; Gaomon и Parblo — равноправно, кто говорил последним).
             // В просмотре реплея ввода нет — засечек тоже.
             if driver.is_none() {
-                let half = crate::stage::note_x(2.0);
-                sprites.push(crate::stage::marker(self.mouse_x, [0.3, 0.8, 1.0, 1.0], self.left_held));
-                if let Some(p) = self.tablets.as_ref().and_then(|t| t.active_state()) {
-                    let x = (p.x_norm * 2.0 - 1.0) * half;
-                    sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
+                if self.line_cursor {
+                    // два вертикальных луча, системного курсора нет; перо —
+                    // только если планшет присутствует
+                    crate::scene::push_live_cursor(&mut sprites, self.mouse_x, tablet_x);
+                } else {
+                    let half = crate::stage::note_x(2.0);
+                    sprites.push(crate::stage::marker(self.mouse_x, [0.3, 0.8, 1.0, 1.0], self.left_held));
+                    if let Some(p) = self.tablets.as_ref().and_then(|t| t.active_state()) {
+                        let x = (p.x_norm * 2.0 - 1.0) * half;
+                        sprites.push(crate::stage::marker(x, [1.0, 0.6, 0.2, 1.0], p.press));
+                    }
                 }
             } else if let Some(driver) = driver {
                 // курсор реплея: два вертикальных луча (левая/правая рука)
@@ -4068,7 +4292,21 @@ pub fn shot_screen(
             renderer.set_camera(&mvp);
             sprites = scene.sprites(t, width, height);
             screen_q[1].color = [1.0, 1.0, 1.0, scene.bg_mask_alpha(t)];
-            sprites.push(crate::stage::marker(app.mouse_x, [0.3, 0.8, 1.0, 1.0], app.left_held));
+            // screenshots may force the Line cursor and a synthetic pen X;
+            // production uses the same scene::push_live_cursor helper
+            let line_cursor = std::env::var("DEEMO_SHOT_LINE_CURSOR").is_ok();
+            let pen_x = std::env::var("DEEMO_SHOT_PEN_X")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(crate::stage::note_x);
+            if line_cursor {
+                crate::scene::push_live_cursor(&mut sprites, app.mouse_x, pen_x);
+            } else {
+                sprites.push(crate::stage::marker(app.mouse_x, [0.3, 0.8, 1.0, 1.0], app.left_held));
+                if let Some(px) = pen_x {
+                    sprites.push(crate::stage::marker(px, [1.0, 0.6, 0.2, 1.0], false));
+                }
+            }
             app.draw_hud(&mut ui, *song, *diff, play, t, *paused, None);
         }
         Mode::Result { song, diff, play } => {
@@ -4300,6 +4538,38 @@ mod tests {
         }
     }
 
+    /// Line cursor в absolute-режиме обязан скрывать системный курсор
+    /// (иначе он «двоится» с пером); без опции — прежнее поведение.
+    #[test]
+    fn line_cursor_hides_the_system_cursor_in_both_modes() {
+        use super::hide_system_cursor;
+        assert!(hide_system_cursor(true, true, true), "absolute + line");
+        assert!(hide_system_cursor(true, true, false), "relative + line");
+        assert!(hide_system_cursor(true, false, false), "relative without line");
+        assert!(!hide_system_cursor(true, false, true), "absolute without line");
+        assert!(!hide_system_cursor(false, true, true), "menu");
+    }
+
+    /// RMB = pen: правая кнопка всегда считается левой рукой и берёт
+    /// планшетный оффсет; X — перо, если планшет есть, иначе мышь. LMB —
+    /// прежняя правая рука/мышь.
+    #[test]
+    fn rmb_press_uses_the_left_hand_and_pen_x_when_present() {
+        use super::{press_aim, PressDevice};
+        let lmb = press_aim(false, Some(1.0), -2.0);
+        assert_eq!(lmb.device, PressDevice::Mouse);
+        assert_eq!(lmb.x, -2.0);
+        assert!(!lmb.tablet_offset);
+        let rmb_pen = press_aim(true, Some(1.0), -2.0);
+        assert_eq!(rmb_pen.device, PressDevice::Pen);
+        assert_eq!(rmb_pen.x, 1.0);
+        assert!(rmb_pen.tablet_offset);
+        let rmb_no_pen = press_aim(true, None, -2.0);
+        assert_eq!(rmb_no_pen.device, PressDevice::Pen);
+        assert_eq!(rmb_no_pen.x, -2.0);
+        assert!(rmb_no_pen.tablet_offset);
+    }
+
     /// Детали открываются по строке и находят реплей строго по нику из
     /// публичного списка; без реплея кнопка выключена с причиной.
     #[test]
@@ -4367,7 +4637,7 @@ mod tests {
     /// импортируется, флаги и чужие пути молча игнорируются.
     #[test]
     fn pack_argument_is_the_first_existing_pack_file() {
-        use super::pack_path_from_args;
+        use super::{file_uri_to_path, pack_path_from_args};
         let dir = std::env::temp_dir().join(format!("deemo-cli-arg-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let pack = dir.join("test pack.deemopack");
@@ -4395,6 +4665,13 @@ mod tests {
         assert_eq!(
             pack_path_from_args(&args(&[zip.to_str().unwrap()])),
             Some(zip.clone())
+        );
+        // file:// URI с percent-escape (так его передают файловые менеджеры)
+        let uri = format!("file://{}", pack.to_str().unwrap().replace(' ', "%20"));
+        assert_eq!(pack_path_from_args(&args(&[&uri])), Some(pack.clone()));
+        assert_eq!(
+            file_uri_to_path("file:///tmp/a%20b.deemopack").as_deref(),
+            Some(std::path::Path::new("/tmp/a b.deemopack"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

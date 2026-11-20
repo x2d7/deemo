@@ -34,6 +34,14 @@ pub struct Settings {
     /// мышь: абсолютная позиция курсора (клик по колонке ноты) вместо относительного delta
     #[serde(default)]
     pub mouse_absolute: bool,
+    /// «Line cursor»: в игре скрыть системный курсор и рисовать два луча
+    /// (мышь/перо) на судейской линии. По умолчанию off — прежнее поведение.
+    #[serde(default)]
+    pub line_cursor: bool,
+    /// «RMB = pen press»: правая кнопка мыши управляет левой рукой (тап/слайд
+    /// с планшетным оффсетом), собственный press пера игнорируется.
+    #[serde(default)]
+    pub rmb_pen_press: bool,
     /// доп. оффсет мыши (мс): + сдвигает тап позже (компенсирует ранний bias мыши)
     #[serde(default)]
     pub mouse_offset_ms: f32,
@@ -78,6 +86,8 @@ impl Default for Settings {
             note_guides: false,
             x_tolerance: def_xtol(),
             mouse_absolute: false,
+            line_cursor: false,
+            rmb_pen_press: false,
             mouse_offset_ms: 0.0,
             tablet_offset_ms: 0.0,
             tablet_press_threshold: 0,
@@ -99,6 +109,31 @@ impl Settings {
         self.tablet_offset_ms = self.tablet_offset_ms.clamp(-250.0, 250.0).round();
         self.tablet_press_threshold = self.tablet_press_threshold.clamp(0, 255);
         self.volume = (self.volume.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Новые опции по умолчанию выключены; старый settings.json без них
+    /// читается (serde default = false), а включённые значения переживают
+    /// round-trip файла.
+    #[test]
+    fn cursor_options_default_off_and_round_trip() {
+        let d = Settings::default();
+        assert!(!d.line_cursor && !d.rmb_pen_press);
+        let old: Settings = serde_json::from_str(r#"{"speed":6.5,"mouse_absolute":true}"#)
+            .expect("old settings file");
+        assert!(!old.line_cursor && !old.rmb_pen_press);
+        let on = Settings {
+            line_cursor: true,
+            rmb_pen_press: true,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&on).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert!(back.line_cursor && back.rmb_pen_press);
     }
 }
 

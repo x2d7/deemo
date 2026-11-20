@@ -314,44 +314,62 @@ pub fn push_replay_cursor(
     if !driver.has_cursor() {
         return;
     }
-    // левая рука — тёплый янтарь (перо), правая — холодный голубой (мышь)
-    for (side, tint) in [
-        (BeamSide::Left, [1.00, 0.66, 0.30, 1.0]),
-        (BeamSide::Right, [0.42, 0.78, 1.00, 1.0]),
-    ] {
-        let Some(px) = driver.beam_x(t, side) else { continue };
-        let x = note_x(px);
-        // вертикальный луч в мире: constant x проецируется в вертикальную
-        // линию на экране (не наклонный floor-маркер)
-        out.push(Sprite::tilted(
-            Tex::White,
-            [x, 0.0, 0.0],
-            0.09,
-            3.8,
-            0.0,
-            [0.5, 0.0],
-            [tint[0], tint[1], tint[2], 0.16],
-        ));
-        out.push(Sprite::tilted(
-            Tex::White,
-            [x, 0.0, 0.0],
-            0.026,
-            3.8,
-            0.0,
-            [0.5, 0.0],
-            [tint[0], tint[1], tint[2], 0.78],
-        ));
-        // мягкое свечение у основания
-        let mut glow = Sprite::tilted(
-            Tex::Glow,
-            [x, 0.01, 0.0],
-            0.52,
-            0.34,
-            std::f32::consts::FRAC_PI_2,
-            [0.5, 0.5],
-            [tint[0], tint[1], tint[2], 0.30],
-        );
-        glow.additive = false;
-        out.push(glow);
+    for side in [BeamSide::Left, BeamSide::Right] {
+        if let Some(px) = driver.beam_x(t, side) {
+            push_beam(out, note_x(px), side);
+        }
     }
+}
+
+/// Живые лучи Line cursor: правая рука — мышь, левая — перо (если планшет
+/// присутствует). Тот же визуал, что у просмотра реплея.
+pub fn push_live_cursor(out: &mut Vec<Sprite>, mouse_x: f32, pen_x: Option<f32>) {
+    use crate::replay::BeamSide;
+    push_beam(out, mouse_x, BeamSide::Right);
+    if let Some(px) = pen_x {
+        push_beam(out, px, BeamSide::Left);
+    }
+}
+
+fn beam_tint(side: crate::replay::BeamSide) -> [f32; 4] {
+    use crate::replay::BeamSide;
+    match side {
+        BeamSide::Left => [1.00, 0.66, 0.30, 1.0],
+        BeamSide::Right => [0.42, 0.78, 1.00, 1.0],
+    }
+}
+
+/// Один вертикальный луч: широкий ореол + тонкое ядро + мягкое свечение у
+/// основания. Несколько квадов, без аллокаций.
+fn push_beam(out: &mut Vec<Sprite>, x: f32, side: crate::replay::BeamSide) {
+    let tint = beam_tint(side);
+    out.push(Sprite::tilted(
+        Tex::White,
+        [x, 0.0, 0.0],
+        0.09,
+        3.8,
+        0.0,
+        [0.5, 0.0],
+        [tint[0], tint[1], tint[2], 0.16],
+    ));
+    out.push(Sprite::tilted(
+        Tex::White,
+        [x, 0.0, 0.0],
+        0.026,
+        3.8,
+        0.0,
+        [0.5, 0.0],
+        [tint[0], tint[1], tint[2], 0.78],
+    ));
+    let mut glow = Sprite::tilted(
+        Tex::Glow,
+        [x, 0.01, 0.0],
+        0.52,
+        0.34,
+        std::f32::consts::FRAC_PI_2,
+        [0.5, 0.5],
+        [tint[0], tint[1], tint[2], 0.30],
+    );
+    glow.additive = false;
+    out.push(glow);
 }

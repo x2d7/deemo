@@ -39,6 +39,8 @@ pub enum Row {
     XTol,
     Guides,
     MouseAbs,
+    LineCursor,
+    RmbPen,
     Fullscreen,
     MouseOffset,
     TabletOffset,
@@ -81,7 +83,10 @@ impl Row {
 
     /// Строка-переключатель ON/OFF.
     fn toggle(self) -> bool {
-        matches!(self, Row::Guides | Row::MouseAbs | Row::Fullscreen)
+        matches!(
+            self,
+            Row::Guides | Row::MouseAbs | Row::LineCursor | Row::RmbPen | Row::Fullscreen
+        )
     }
 
     /// Кнопка (Enter активирует, значение не показывается).
@@ -112,6 +117,8 @@ impl Row {
             Row::XTol => "X tolerance",
             Row::Guides => "Note guides",
             Row::MouseAbs => "Absolute mouse",
+            Row::LineCursor => "Line cursor",
+            Row::RmbPen => "RMB = pen press",
             Row::Fullscreen => "Fullscreen",
             Row::MouseOffset => "Mouse offset",
             Row::TabletOffset => "Tablet offset",
@@ -368,6 +375,8 @@ impl SettingsScreen {
             Row::XTol,
             Row::Guides,
             Row::MouseAbs,
+            Row::LineCursor,
+            Row::RmbPen,
             Row::Fullscreen,
             Row::MouseOffset,
             Row::TabletOffset,
@@ -474,7 +483,7 @@ impl SettingsScreen {
         // ---- GAMEPLAY ----
         let gy = top;
         // окна судейства и сырые X планшетов зашиты в игру и здесь не показываются
-        let gh = 288.0 * s;
+        let gh = 340.0 * s;
         self.cards.push(([rx, gy, rw, gh], "GAMEPLAY"));
         let colw = (rw - 48.0 * s) * 0.5;
         let x1 = rx + 16.0 * s;
@@ -484,13 +493,20 @@ impl SettingsScreen {
             Row::XTol,
             Row::Guides,
             Row::MouseAbs,
-            Row::Fullscreen,
+            Row::LineCursor,
+            Row::RmbPen,
         ];
         for (i, row) in col1.iter().enumerate() {
             let y = gy + 52.0 * s + i as f32 * 42.0 * s;
             self.place_value_row(*row, [x1, y, colw, 34.0 * s], s);
         }
-        let col2 = [Row::MouseOffset, Row::TabletOffset, Row::Zoom, Row::Press];
+        let col2 = [
+            Row::MouseOffset,
+            Row::TabletOffset,
+            Row::Zoom,
+            Row::Press,
+            Row::Fullscreen,
+        ];
         for (i, row) in col2.iter().enumerate() {
             let y = gy + 52.0 * s + i as f32 * 42.0 * s;
             self.place_value_row(*row, [x2, y, colw, 34.0 * s], s);
@@ -592,6 +608,8 @@ impl SettingsScreen {
         match row {
             Row::Guides => self.draft.note_guides = !self.draft.note_guides,
             Row::MouseAbs => self.draft.mouse_absolute = !self.draft.mouse_absolute,
+            Row::LineCursor => self.draft.line_cursor = !self.draft.line_cursor,
+            Row::RmbPen => self.draft.rmb_pen_press = !self.draft.rmb_pen_press,
             Row::Fullscreen => self.draft.fullscreen = !self.draft.fullscreen,
             _ => return,
         }
@@ -828,6 +846,8 @@ impl SettingsScreen {
             Row::XTol => format!("{:.2}", s.x_tolerance),
             Row::Guides => on_off(s.note_guides),
             Row::MouseAbs => on_off(s.mouse_absolute),
+            Row::LineCursor => on_off(s.line_cursor),
+            Row::RmbPen => on_off(s.rmb_pen_press),
             Row::Fullscreen => on_off(s.fullscreen),
             Row::MouseOffset => format!("{:+.0} ms", s.mouse_offset_ms),
             Row::TabletOffset => format!("{:+.0} ms", s.tablet_offset_ms),
@@ -1224,4 +1244,32 @@ fn field_view(text: &Text, s: &str, caret: usize, max_w: f32, size: f32) -> (Str
         shown.pop();
     }
     (shown, caret_px)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::{Key, NamedKey};
+
+    /// Новые переключатели достижимы стрелками и включаются Space, как и
+    /// остальные строки. Заодно проверяем порядок строк (рядом с MouseAbs).
+    #[test]
+    fn line_cursor_and_rmb_are_keyboard_reachable() {
+        let on = crate::online::Online {
+            state: crate::online::AuthState::default(),
+        };
+        let mut sc = SettingsScreen::new(Settings::default(), &on);
+        let down = Key::Named(NamedKey::ArrowDown);
+        let space = Key::Named(NamedKey::Space);
+        for _ in 0..11 {
+            let _ = sc.on_key(&down, false, false);
+        }
+        assert_eq!(sc.rows[sc.row], Row::LineCursor, "row {row:?}", row = sc.row);
+        let _ = sc.on_key(&space, false, false);
+        assert!(sc.draft.line_cursor);
+        let _ = sc.on_key(&down, false, false);
+        assert_eq!(sc.rows[sc.row], Row::RmbPen);
+        let _ = sc.on_key(&space, false, false);
+        assert!(sc.draft.rmb_pen_press);
+    }
 }

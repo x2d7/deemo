@@ -43,17 +43,16 @@ pub fn register() -> Result<String, String> {
 /// Write the startup result where it can be read later: `data/deemo.log` on
 /// Windows, stderr elsewhere. Association failures never reach the UI.
 pub fn log(msg: &str) {
-    #[cfg(target_os = "windows")]
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("data/deemo.log")
     {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("data/deemo.log")
-        {
-            let _ = writeln!(f, "{msg}");
-        }
+        let _ = writeln!(f, "{msg}");
     }
+    // Windows release already redirects stderr to its own log; on Linux the
+    // file above is the one a file-manager launch can find.
     #[cfg(not(target_os = "windows"))]
     {
         eprintln!("{msg}");
@@ -82,9 +81,17 @@ fn desktop_exec(exe: &Path) -> String {
 
 #[cfg(target_os = "linux")]
 fn desktop_file(exe: &Path) -> String {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let path = dir.to_string_lossy();
+    let path = if path.chars().any(char::is_whitespace) {
+        format!("\"{path}\"")
+    } else {
+        path.into_owned()
+    };
     format!(
-        "[Desktop Entry]\nType=Application\nName=Deemo\nComment=Deemo rhythm game\nExec={} %f\nMimeType=application/x-deemopack;\nTerminal=false\nCategories=Game;\n",
-        desktop_exec(exe)
+        "[Desktop Entry]\nType=Application\nName=Deemo\nComment=Deemo rhythm game\nExec={} %f\nPath={}\nMimeType=application/x-deemopack;\nTerminal=false\nCategories=Game;\n",
+        desktop_exec(exe),
+        path
     )
 }
 
@@ -279,6 +286,7 @@ mod tests {
         assert!(mime.contains("*.deemopack"));
         let desk = std::fs::read_to_string(dir.join("applications/deemo.desktop")).unwrap();
         assert!(desk.contains("Exec=/opt/Deemo/deemo %f"), "{desk}");
+        assert!(desk.contains("Path=/opt/Deemo"), "{desk}");
         assert!(desk.contains("MimeType=application/x-deemopack;"));
         assert!(desk.contains("Terminal=false"));
         // second run: exact same bytes, no rewrite
@@ -297,6 +305,7 @@ mod tests {
         assert!(linux_install(&dir, moved, false).unwrap());
         let desk = std::fs::read_to_string(dir.join("applications/deemo.desktop")).unwrap();
         assert!(desk.contains("Exec=\"/opt/Deemo moved/deemo\" %f"), "{desk}");
+        assert!(desk.contains("Path=\"/opt/Deemo moved\""), "{desk}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

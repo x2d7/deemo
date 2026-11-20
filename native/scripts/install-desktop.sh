@@ -44,12 +44,18 @@ exec_line=$bin
 case "$bin" in
     *[[:space:]]*) exec_line="\"$bin\"" ;;
 esac
+bin_dir=$(dirname -- "$bin")
+path_line=$bin_dir
+case "$bin_dir" in
+    *[[:space:]]*) path_line="\"$bin_dir\"" ;;
+esac
 cat > "$apps_dir/deemo.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Deemo
 Comment=Deemo rhythm game
 Exec=$exec_line %f
+Path=$path_line
 MimeType=application/x-deemopack;
 Terminal=false
 Categories=Game;

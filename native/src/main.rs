@@ -1097,7 +1097,31 @@ fn init_release_logging(probe: bool) {
     );
 }
 
+/// Если `data/` нет в текущей папке, но есть рядом с exe — перейти туда.
+/// Так работает запуск из `.desktop`/ярлыка/двойного клика, где CWD = $HOME.
+fn game_dir_for(current: &std::path::Path, exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    if current.join("data").is_dir() {
+        return None;
+    }
+    let dir = exe.parent()?;
+    dir.join("data").is_dir().then(|| dir.to_path_buf())
+}
+
+fn ensure_game_cwd() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Some(exe) = std::env::current_exe().ok() else {
+        return;
+    };
+    if let Some(dir) = game_dir_for(&cwd, &exe) {
+        let _ = std::env::set_current_dir(dir);
+    }
+}
+
 fn main() -> Result<()> {
+    // launch from a desktop file / shortcut: data lives next to the binary
+    ensure_game_cwd();
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(all(windows, not(debug_assertions)))]
     init_release_logging(args.iter().any(|a| a == "--tablet-probe"));
@@ -1199,4 +1223,29 @@ fn main() -> Result<()> {
     }
 
     app::run()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::game_dir_for;
+
+    #[test]
+    fn game_dir_falls_back_to_the_executable_folder_only_when_needed() {
+        let root = std::env::temp_dir().join(format!("deemo-cwd-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        let exe_dir = root.join("game");
+        let exe = exe_dir.join("deemo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(exe_dir.join("data")).unwrap();
+        assert_eq!(game_dir_for(&cwd, &exe), Some(exe_dir.clone()));
+        // в CWD уже есть data — ничего не меняем
+        std::fs::create_dir_all(cwd.join("data")).unwrap();
+        assert_eq!(game_dir_for(&cwd, &exe), None);
+        // рядом с exe нет data — не угадываем
+        std::fs::remove_dir_all(&cwd).unwrap();
+        std::fs::remove_dir_all(exe_dir.join("data")).unwrap();
+        assert_eq!(game_dir_for(&cwd, &exe), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
